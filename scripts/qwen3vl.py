@@ -10,8 +10,8 @@ import torch
 import transformers
 
 from libinfinicore_infer import (
-    JiugeAWQModel,
-    JiugeAWQMetaCStruct,
+    Qwen3VLModel,
+    Qwen3VLMetaCStruct,
     DataType,
     DeviceType,
     KVCacheCStruct,
@@ -23,78 +23,53 @@ from ctypes import POINTER, c_float, c_int, c_uint, c_void_p, byref
 torch.set_default_device("cpu")
 
 
-class JiugeAWQMetaFromConfig(JiugeAWQMetaCStruct):
-    def __init__(self, config, dtype=torch.float16, max_tokens=None):
-        if config["torch_dtype"] == "float16":
+class Qwen3VLMetaFromConfig(Qwen3VLMetaCStruct):
+    def __init__(self, config, dtype=torch.bfloat16, max_tokens=None):
+        if dtype == torch.float16:
             dt_ = DataType.INFINI_DTYPE_F16
-        elif config["torch_dtype"] == "float32":
+        elif dtype == torch.float32:
             dt_ = DataType.INFINI_DTYPE_F32
-        elif config["torch_dtype"] == "bfloat16":
+        elif dtype == torch.bfloat16:
             dt_ = DataType.INFINI_DTYPE_BF16
         else:
-            dt_ = DataType.INFINI_DTYPE_F16
+            dt_ = DataType.INFINI_DTYPE_BF16
 
         self.scale_input = 1.0
         self.scale_output = 1.0
         self.scale_o = 1.0
         self.scale_down = 1.0
-        if (
-            config["model_type"] in ["fm9g", "minicpm"]
-            and "scale_emb" in config
-            and "scale_depth" in config
-            and "dim_model_base" in config
-        ):
-            self.scale_input = config["scale_emb"]
-            self.scale_output = config["hidden_size"] // config["dim_model_base"]
-            self.scale_o = config["scale_depth"] / math.sqrt(
-                config["num_hidden_layers"]
-            )
-            self.scale_down = config["scale_depth"] / math.sqrt(
-                config["num_hidden_layers"]
-            )
-
-        has_qkv_bias = (
-            1 if "attention_bias" in config and config["attention_bias"] else 0
-        )
-        if config["model_type"] in ["qwen2", "qwen3"]:
-            has_qkv_bias = 1
-
-        eos_token_id = (
-            config["eos_token_id"][0]
-            if type(config["eos_token_id"]) == list
-            else config["eos_token_id"]
-        )
+        has_qkv_bias = 0
+        eos_token_id = config["eos_token_id"]
+        vision_config = config.get("vision_config", {})
 
         super().__init__(
             dt_logits=dt_,
-            dt_linear_w=DataType.INFINI_DTYPE_I32,
+            dt_linear_w=dt_,
             dt_norm_w=dt_,
             nlayer=config["num_hidden_layers"],
             d=config["hidden_size"],
             nh=config["num_attention_heads"],
-            nkvh=(
-                config["num_key_value_heads"]
-                if "num_key_value_heads" in config
-                else config["num_attention_heads"]
-            ),
-            dh=config["hidden_size"] // config["num_attention_heads"],
+            nkvh=config["num_key_value_heads"],
+            dh=config["head_dim"],
             di=config["intermediate_size"],
-            dctx=(
-                config["max_position_embeddings"] if max_tokens is None else max_tokens
-            ),
+            dctx=config["max_position_embeddings"] if max_tokens is None else max_tokens,
             dvoc=config["vocab_size"],
             epsilon=config["rms_norm_eps"],
-            theta=(config["rope_theta"]
-                   if "rope_theta" in config else 100000.0),
+            theta=config["rope_theta"],
             end_token=eos_token_id,
-            nbit=config["quantization_config"]["bits"],
-            quant_group_size=config["quantization_config"]["group_size"],
             has_qkv_bias=has_qkv_bias,
+            # vision encoder parameters
+            use_qk_norm=1 if config.get("use_qk_norm", False) else 0,
+            vision_hidden_size=vision_config.get("hidden_size", 768),
+            vision_layers=vision_config.get("depth", 12),
+            vision_heads=vision_config.get("num_heads", 12),
+            patch_size=vision_config.get("patch_size", 16),
+            img_size=vision_config.get("img_size", 768),
         )
         self.torch_dtype_logits = dtype
 
 
-class JiugeAWQBatchedTask:
+class Qwen3VLBatchedTask:
     def __init__(self, tasks: List[InferTask]):
         self.tasks = tasks
         self.nreq = len(tasks)
@@ -136,11 +111,8 @@ class JiugeAWQBatchedTask:
         )
 
 
-class JiugeAWQForCausalLM:
-    def __init__(
-        self, model_dir_path, device=DeviceType.DEVICE_TYPE_CPU, ndev=1, max_tokens=None
-    ):
-
+class Qwen3VLForCausalLM:
+    def __init__(self, model_dir_path, device=DeviceType.DEVICE_TYPE_CPU, ndev=1, max_tokens=None):
         load_start_time = time.time()
         print(f"Creating model on {ndev} devices...")
         with open(os.path.join(model_dir_path, "config.json"), "r") as f:
@@ -153,11 +125,11 @@ class JiugeAWQForCausalLM:
         self.dev_ids = (c_int * ndev)(*[i for i in range(ndev)])
         self.ndev = ndev
         self.device = device
-        self.meta = JiugeAWQMetaFromConfig(config, max_tokens=max_tokens)
+        self.meta = Qwen3VLMetaFromConfig(config, max_tokens=max_tokens)
 
-        self.jiuge_awq_model = JiugeAWQModel()
+        self.qwen3vl_model = Qwen3VLModel()
 
-        self.weights = self.jiuge_awq_model.create_weights(
+        self.weights = self.qwen3vl_model.create_weights(
             byref(self.meta),
             self.device,
             ndev,
@@ -175,7 +147,7 @@ class JiugeAWQForCausalLM:
 
         self.load_all_safetensors_from_dir(os.path.join(model_dir_path))
 
-        self.model_instance = self.jiuge_awq_model.create_model(
+        self.model_instance = self.qwen3vl_model.create_model(
             byref(self.meta),
             self.weights,
         )
@@ -184,9 +156,11 @@ class JiugeAWQForCausalLM:
 
     def load_all_safetensors_from_dir(self, dir_path_: str):
         dir_path_ = Path(dir_path_)
+        total_keys = 0
         for file in sorted(dir_path_.glob("*.safetensors")):
             with safetensors.safe_open(file, framework="pt", device="cpu") as f:
                 for key in f.keys():
+                    total_keys += 1
                     # print(key)
                     tensor = f.get_tensor(key)
                     if "o_proj.scales" in key:
@@ -197,15 +171,16 @@ class JiugeAWQForCausalLM:
                         tensor = tensor * self.meta.scale_input
                     elif "lm_head.weight" in key:
                         tensor = tensor * self.meta.scale_output
-                    self.jiuge_awq_model.load_weight(
+                    self.qwen3vl_model.load_weight(
                         self.weights, key, tensor.data_ptr()
                     )
+        print(f"加载的张量 key 总数: {total_keys}")
 
     def max_context_len(self):
         return self.meta.dctx
 
     def create_kv_cache(self):
-        return self.jiuge_awq_model.create_kv_cache(
+        return self.qwen3vl_model.create_kv_cache(
             self.meta.nlayer,
             self.meta.dctx,
             self.meta.nkvh,
@@ -218,12 +193,12 @@ class JiugeAWQForCausalLM:
         )
 
     def drop_kv_cache(self, kv_cache):
-        self.jiuge_awq_model.drop_kv_cache(kv_cache)
+        self.qwen3vl_model.drop_kv_cache(kv_cache)
 
     def batch_infer_one_round(self, tasks: List[InferTask]):
         output = (c_uint * len(tasks))()
-        batch_inputs = JiugeAWQBatchedTask(tasks)
-        self.jiuge_awq_model.infer_batch(
+        batch_inputs = Qwen3VLBatchedTask(tasks)
+        self.qwen3vl_model.infer_batch(
             self.model_instance,
             *(batch_inputs.input_args()),
             output,
@@ -301,11 +276,11 @@ class JiugeAWQForCausalLM:
                 tasks[batch_id].bind_kvcache(kv_caches[batch_id])
                 batch_id += 1
 
-            batch_inputs = JiugeAWQBatchedTask(tasks[:batch_id])
+            batch_inputs = Qwen3VLBatchedTask(tasks[:batch_id])
             logits = torch.zeros(
                 (batch_inputs.ntok, self.meta.dvoc), dtype=self.meta.torch_dtype_logits
             )
-            self.jiuge_awq_model.forward_batch(
+            self.qwen3vl_model.forward_batch(
                 self.model_instance,
                 batch_inputs.tokens,
                 batch_inputs.ntok,
@@ -336,14 +311,14 @@ class JiugeAWQForCausalLM:
         return math.exp(nll / total_len)
 
     def destroy_model_instance(self):
-        self.jiuge_awq_model.destroy_model(self.model_instance)
+        self.qwen3vl_model.destroy_model(self.model_instance)
         print("Model destroyed")
 
 
 def test():
     if len(sys.argv) < 3:
         print(
-            "Usage: python jiuge_awq.py [--cpu | --nvidia| --cambricon | --ascend | --metax | --moore] <path/to/model_dir> [n_device]"
+            "Usage: python qwen3vl.py [--cpu | --nvidia| --cambricon | --ascend | --metax | --moore] <path/to/model_dir> [n_device]"
         )
         sys.exit(1)
     model_path = sys.argv[2]
@@ -364,12 +339,12 @@ def test():
         device_type = DeviceType.DEVICE_TYPE_ILUVATAR
     else:
         print(
-            "Usage: python main_jiuge_awq.py [--cpu | --nvidia| --cambricon | --ascend | --metax | --moore] <path/to/model_dir> [n_device]"
+            "Usage: python qwen3vl.py [--cpu | --nvidia| --cambricon | --ascend | --metax | --moore] <path/to/model_dir> [n_device]"
         )
         sys.exit(1)
 
     ndev = int(sys.argv[3]) if len(sys.argv) > 3 else 1
-    model = JiugeAWQForCausalLM(model_path, device_type, ndev)
+    model = Qwen3VLForCausalLM(model_path, device_type, ndev)
     model.generate("山东最高的山是？", 500)
     model.destroy_model_instance()
 

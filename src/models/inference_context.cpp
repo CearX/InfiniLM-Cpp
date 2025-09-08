@@ -147,6 +147,60 @@ void InferenceContext::rope_v2(std::shared_ptr<Tensor> q,
         sin->data(), cos->data(), stream));
 }
 
+void InferenceContext::mrope_2d(std::shared_ptr<Tensor> q,
+                                std::shared_ptr<Tensor> k,
+                                std::shared_ptr<Tensor> pos,
+                                std::shared_ptr<Tensor> sin,
+                                std::shared_ptr<Tensor> cos) {
+    size_t key = CacheManager::createDescriptorKey(q, k, pos, sin, cos);
+
+    infiniopMRoPE2DDescriptor_t desc;
+    if (!cache_manager->getMRoPE2DDescriptor(key, desc)) {
+        RUN_INFINI(infiniopCreateMRoPE2DDescriptor(
+            op_handle, &desc, q->desc(), k->desc(),
+            pos->desc(), sin->desc(), cos->desc()));
+        cache_manager->putMRoPE2DDescriptor(key, desc);
+    }
+
+    size_t workspace_size = 0;
+    RUN_INFINI(infiniopGetMRoPE2DWorkspaceSize(desc, &workspace_size));
+    ensure_workspace(workspace_size);
+    void *workspace = workspace_storage->memory();
+
+    RUN_INFINI(infiniopMRoPE2D(
+        desc, workspace, workspace_size,
+        q->data(), k->data(), pos->data(),
+        sin->data(), cos->data(), stream));
+}
+
+void InferenceContext::mrope_3d(std::shared_ptr<Tensor> q,
+                                std::shared_ptr<Tensor> k,
+                                std::shared_ptr<Tensor> pos,
+                                std::shared_ptr<Tensor> sin,
+                                std::shared_ptr<Tensor> cos,
+                                std::shared_ptr<Tensor> rope_section) {
+    size_t key = CacheManager::createDescriptorKey(q, k, pos, sin, cos, rope_section);
+
+    infiniopMRoPE3DDescriptor_t desc;
+    if (!cache_manager->getMRoPE3DDescriptor(key, desc)) {
+        RUN_INFINI(infiniopCreateMRoPE3DDescriptor(
+            op_handle, &desc, q->desc(), k->desc(),
+            pos->desc(), sin->desc(), cos->desc(),
+            rope_section->desc()));
+        cache_manager->putMRoPE3DDescriptor(key, desc);
+    }
+
+    size_t workspace_size = 0;
+    RUN_INFINI(infiniopGetMRoPE3DWorkspaceSize(desc, &workspace_size));
+    ensure_workspace(workspace_size);
+    void *workspace = workspace_storage->memory();
+
+    RUN_INFINI(infiniopMRoPE3D(
+        desc, workspace, workspace_size,
+        q->data(), k->data(), pos->data(),
+        sin->data(), cos->data(), rope_section->data(), stream));
+}
+
 void InferenceContext::causalSoftmax(std::shared_ptr<Tensor> y,
                                      std::shared_ptr<Tensor> x) {
     size_t key = CacheManager::createDescriptorKey(y, x);

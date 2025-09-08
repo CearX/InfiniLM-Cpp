@@ -27,3 +27,10 @@ cache/
 *.txt
 
 *.http
+
+# temp
+vllm-qwen/
+qw2vl.py
+qw3vl_plan.md
+.cache/
+.clangd/

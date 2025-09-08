@@ -12,7 +12,7 @@ from ctypes import (
 )
 
 
-class JiugeAWQMetaCStruct(Structure):
+class Qwen3VLMetaCStruct(Structure):
     _fields_ = [
         ("dt_logits", DataType),
         ("dt_linear_w", DataType),
@@ -28,36 +28,41 @@ class JiugeAWQMetaCStruct(Structure):
         ("epsilon", c_float),
         ("theta", c_float),
         ("end_token", c_uint),
-        ("nbit", c_size_t),
-        ("quant_group_size", c_size_t),
         ("has_qkv_bias", c_char),
+        # vision encoder parameters
+        ("use_qk_norm", c_char),
+        ("vision_hidden_size", c_size_t),
+        ("vision_layers", c_size_t),
+        ("vision_heads", c_size_t),
+        ("patch_size", c_size_t),
+        ("img_size", c_size_t),
     ]
 
 
-class JiugeAWQModelCStruct(Structure):
+class Qwen3VLModelCStruct(Structure):
     pass
 
 
 @register_model
-class JiugeAWQModel(BaseModel):
+class Qwen3VLModel(BaseModel):
     @classmethod
     def register_lib(cls, lib):
-        """Register JiugeAWQ model functions with the library"""
-        lib.createJiugeAWQWeights.restype = POINTER(ModelWeightsCStruct)
-        lib.createJiugeAWQWeights.argtypes = [
-            POINTER(JiugeAWQMetaCStruct),
+        """Register Qwen3VL model functions with the library"""
+        lib.createQwen3VLWeights.restype = POINTER(ModelWeightsCStruct)
+        lib.createQwen3VLWeights.argtypes = [
+            POINTER(Qwen3VLMetaCStruct),
             DeviceType,
             c_int,
             POINTER(c_int),
         ]
 
-        lib.createJiugeAWQModel.restype = POINTER(JiugeAWQModelCStruct)
-        lib.createJiugeAWQModel.argtypes = [
-            POINTER(JiugeAWQMetaCStruct),
+        lib.createQwen3VLModel.restype = POINTER(Qwen3VLModelCStruct)
+        lib.createQwen3VLModel.argtypes = [
+            POINTER(Qwen3VLMetaCStruct),
             POINTER(ModelWeightsCStruct),
         ]
 
-        lib.destroyJiugeAWQModel.argtypes = [POINTER(JiugeAWQModelCStruct)]
+        lib.destroyQwen3VLModel.argtypes = [POINTER(Qwen3VLModelCStruct)]
 
         lib.createKVCache.argtypes = [
             c_size_t,
@@ -74,8 +79,8 @@ class JiugeAWQModel(BaseModel):
 
         lib.dropKVCache.argtypes = [POINTER(KVCacheCStruct)]
 
-        lib.inferBatchJiugeAWQ.argtypes = [
-            POINTER(JiugeAWQModelCStruct),
+        lib.inferBatchQwen3VL.argtypes = [
+            POINTER(Qwen3VLModelCStruct),
             POINTER(c_uint),
             c_uint,
             POINTER(c_uint),
@@ -88,8 +93,8 @@ class JiugeAWQModel(BaseModel):
             POINTER(c_uint),
         ]
 
-        lib.forwardBatchJiugeAWQ.argtypes = [
-            POINTER(JiugeAWQModelCStruct),
+        lib.forwardBatchQwen3VL.argtypes = [
+            POINTER(Qwen3VLModelCStruct),
             POINTER(c_uint),
             c_uint,
             POINTER(c_uint),
@@ -106,13 +111,13 @@ class JiugeAWQModel(BaseModel):
         ]
 
     def create_weights(self, meta, device_type, ndev, dev_ids):
-        return self.lib.createJiugeAWQWeights(meta, device_type, ndev, dev_ids)
+        return self.lib.createQwen3VLWeights(meta, device_type, ndev, dev_ids)
 
     def create_model(self, meta, weights):
-        return self.lib.createJiugeAWQModel(meta, weights)
+        return self.lib.createQwen3VLModel(meta, weights)
 
     def destroy_model(self, model):
-        self.lib.destroyJiugeAWQModel(model)
+        self.lib.destroyQwen3VLModel(model)
 
     def create_kv_cache(
         self, nlayer, max_len, nkvh, dk, dv, dtype, device, dev_ids, ndev
@@ -141,7 +146,7 @@ class JiugeAWQModel(BaseModel):
         topp,
         output,
     ):
-        self.lib.inferBatchJiugeAWQ(
+        self.lib.inferBatchQwen3VL(
             model,
             tokens,
             ntok,
@@ -158,6 +163,6 @@ class JiugeAWQModel(BaseModel):
     def forward_batch(
         self, model, tokens, ntok, req_lens, nreq, req_pos, kv_caches, logits
     ):
-        self.lib.forwardBatchJiugeAWQ(
+        self.lib.forwardBatchQwen3VL(
             model, tokens, ntok, req_lens, nreq, req_pos, kv_caches, logits
         )

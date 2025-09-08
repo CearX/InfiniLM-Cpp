@@ -157,6 +157,8 @@ public:
     DECLARE_OP_CACHE(Gemm)
     DECLARE_OP_CACHE(RoPE)
     DECLARE_OP_CACHE(RoPEv2)
+    DECLARE_OP_CACHE(MRoPE2D)
+    DECLARE_OP_CACHE(MRoPE3D)
     DECLARE_OP_CACHE(Rearrange)
     DECLARE_OP_CACHE(CausalSoftmax)
     DECLARE_OP_CACHE(Topkrouter)
@@ -170,6 +172,8 @@ public:
           Gemm_cache(capacity, DESTROY_FUNC(Gemm)),
           RoPE_cache(capacity, DESTROY_FUNC(RoPE)),
           RoPEv2_cache(capacity, DESTROY_FUNC(RoPEv2)),
+          MRoPE2D_cache(capacity, DESTROY_FUNC(MRoPE2D)),
+          MRoPE3D_cache(capacity, DESTROY_FUNC(MRoPE3D)),
           Rearrange_cache(capacity, DESTROY_FUNC(Rearrange)),
           CausalSoftmax_cache(capacity, DESTROY_FUNC(CausalSoftmax)),
           Topkrouter_cache(capacity, DESTROY_FUNC(Topkrouter)),

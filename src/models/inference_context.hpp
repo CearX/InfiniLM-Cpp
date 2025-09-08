@@ -39,6 +39,17 @@ struct InferenceContext {
                  std::shared_ptr<Tensor> pos,
                  std::shared_ptr<Tensor> sin,
                  std::shared_ptr<Tensor> cos);
+    void mrope_2d(std::shared_ptr<Tensor> q,
+                  std::shared_ptr<Tensor> k,
+                  std::shared_ptr<Tensor> pos,
+                  std::shared_ptr<Tensor> sin,
+                  std::shared_ptr<Tensor> cos);
+    void mrope_3d(std::shared_ptr<Tensor> q,
+                  std::shared_ptr<Tensor> k,
+                  std::shared_ptr<Tensor> pos,
+                  std::shared_ptr<Tensor> sin,
+                  std::shared_ptr<Tensor> cos,
+                  std::shared_ptr<Tensor> rope_section);
     void causalSoftmax(std::shared_ptr<Tensor> y,
                        std::shared_ptr<Tensor> x);
 
@@ -109,6 +120,18 @@ inline void rope_v2(std::shared_ptr<Tensor> q, std::shared_ptr<Tensor> k,
                     std::shared_ptr<Tensor> pos, std::shared_ptr<Tensor> sin,
                     std::shared_ptr<Tensor> cos) {
     getInferenceContext().rope_v2(q, k, pos, sin, cos);
+}
+
+inline void mrope_2d(std::shared_ptr<Tensor> q, std::shared_ptr<Tensor> k,
+                     std::shared_ptr<Tensor> pos, std::shared_ptr<Tensor> sin,
+                     std::shared_ptr<Tensor> cos) {
+    getInferenceContext().mrope_2d(q, k, pos, sin, cos);
+}
+
+inline void mrope_3d(std::shared_ptr<Tensor> q, std::shared_ptr<Tensor> k,
+                     std::shared_ptr<Tensor> pos, std::shared_ptr<Tensor> sin,
+                     std::shared_ptr<Tensor> cos, std::shared_ptr<Tensor> rope_section) {
+    getInferenceContext().mrope_3d(q, k, pos, sin, cos, rope_section);
 }
 
 inline void causalSoftmax(std::shared_ptr<Tensor> y, std::shared_ptr<Tensor> x) {
