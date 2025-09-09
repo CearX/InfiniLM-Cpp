@@ -49,6 +49,7 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
                       uint32_t idev, uint32_t ndev,
                       const uint32_t *tokens, uint32_t ntok,
                       const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
+                      const uint32_t *pos_ids, uint32_t pos_ids_len,
                       struct KVCache **kv_caches,
                       const float *temperature, const uint32_t *topk, const float *topp,
                       uint32_t *output, void *last_logits) {
@@ -92,11 +93,13 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
     }
 
     std::shared_ptr<Tensor> pos_ids_buf;
+    // ViT 部分：直接使用传入的 pos_ids，reshape 为 2D [num_patches, 2]
+    uint32_t num_patches = pos_ids_len / 2; // 扁平数组长度 / 2 = patch 数量
     if (rsrc.device == INFINI_DEVICE_CPU) {
-        pos_ids_buf = Tensor::weight(batch_pos_ids.data(), INFINI_DTYPE_U32, {ntok});
+        pos_ids_buf = Tensor::weight(const_cast<uint32_t *>(pos_ids), INFINI_DTYPE_U32, {num_patches, 2});
     } else {
-        pos_ids_buf = Tensor::buffer(INFINI_DTYPE_U32, {ntok}, rsrc.memory_pool);
-        RUN_INFINI(infinirtMemcpyAsync(pos_ids_buf->data(), batch_pos_ids.data(), sizeof(uint32_t) * ntok,
+        pos_ids_buf = Tensor::buffer(INFINI_DTYPE_U32, {num_patches, 2}, rsrc.memory_pool);
+        RUN_INFINI(infinirtMemcpyAsync(pos_ids_buf->data(), pos_ids, sizeof(uint32_t) * pos_ids_len,
                                        INFINIRT_MEMCPY_H2D, stream));
     }
     for (uint32_t i = 0; i < ntok; i++) {
@@ -140,8 +143,8 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
                weight->w_attn_v[layer],
                1.0, 0.0, nullptr, has_qkv_bias ? weight->b_attn_v[layer] : nullptr);
         // mrope_2d
-        mrope_2d(q_buf->view({ntok, nh, dh}), q_buf->view({ntok, nh, dh}), pos_ids_buf, weight->sin_table, weight->cos_table);
-        mrope_2d(k_buf->view({ntok, nkvh, dh}), k_buf->view({ntok, nkvh, dh}), pos_ids_buf, weight->sin_table, weight->cos_table);
+        mrope_2d(q_buf->view({nh, ntok, dh}), q_buf->view({nh, ntok, dh}), pos_ids_buf, weight->sin_table, weight->cos_table);
+        mrope_2d(k_buf->view({nkvh, ntok, dh}), k_buf->view({nkvh, ntok, dh}), pos_ids_buf, weight->sin_table, weight->cos_table);
         size_t token_offset = 0;
         for (uint32_t req = 0; req < nreq; req++) {
             auto past_len = req_pos[req];
@@ -246,6 +249,7 @@ __C void
 inferBatchQwen3VL(struct Qwen3VLModel *model,
                   const uint32_t *tokens, uint32_t ntok,
                   const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
+                  const uint32_t *pos_ids, uint32_t pos_ids_len,
                   struct KVCache **kv_caches,
                   const float *temperature, const uint32_t *topk, const float *topp,
                   uint32_t *output) {
@@ -254,6 +258,8 @@ inferBatchQwen3VL(struct Qwen3VLModel *model,
     model->req.req_lens = req_lens;
     model->req.nreq = nreq;
     model->req.req_pos = req_pos;
+    model->req.pos_ids = pos_ids;
+    model->req.pos_ids_len = pos_ids_len;
     model->req.kv_caches = kv_caches;
     model->req.output = output;
     model->req.logits = nullptr;
@@ -279,6 +285,7 @@ __C void
 forwardBatchQwen3VL(struct Qwen3VLModel *model,
                     const uint32_t *tokens, uint32_t ntok,
                     const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
+                    const uint32_t *pos_ids, uint32_t pos_ids_len,
                     struct KVCache **kv_caches,
                     void *logits) {
     model->req.tokens = tokens;
@@ -286,6 +293,8 @@ forwardBatchQwen3VL(struct Qwen3VLModel *model,
     model->req.req_lens = req_lens;
     model->req.nreq = nreq;
     model->req.req_pos = req_pos;
+    model->req.pos_ids = pos_ids;
+    model->req.pos_ids_len = pos_ids_len;
     model->req.kv_caches = kv_caches;
     model->req.output = nullptr;
     model->req.logits = logits;
@@ -335,8 +344,8 @@ void launchDevice(const Qwen3VLMeta *meta, std::shared_ptr<Qwen3VLDeviceWeight> 
         }
 
         inferDeviceBatch(meta, *rsrc, idev, ndev, req.tokens, req.ntok,
-                         req.req_lens, req.nreq, req.req_pos, req.kv_caches,
-                         req.temperature, req.topk, req.topp, req.output, req.logits);
+                         req.req_lens, req.nreq, req.req_pos, req.pos_ids, req.pos_ids_len,
+                         req.kv_caches, req.temperature, req.topk, req.topp, req.output, req.logits);
 
         state.proceed = false;
         lock.unlock();

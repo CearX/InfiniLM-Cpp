@@ -2,9 +2,9 @@
 
 #include <cmath>
 
-inline std::shared_ptr<Tensor> getSinTable(size_t dctx, size_t dh, float theta) {
-    auto half_dh = dh / 2;
-    auto unit = dsize(INFINI_DTYPE_F16);
+inline std::shared_ptr<Tensor> getSinTable(size_t dctx, size_t dh, float theta, infiniDtype_t dtype) {
+    auto half_dh = dh / 4; // 2D MRoPE: table_dim = dhead / 4
+    auto unit = dsize(dtype);
     void *table = std::malloc(dctx * half_dh * unit);
 
     for (size_t i = 0; i < dctx; i++) {
@@ -12,18 +12,27 @@ inline std::shared_ptr<Tensor> getSinTable(size_t dctx, size_t dh, float theta) 
             float _sin = std::sin(
                 static_cast<float>(i) / std::pow(theta, static_cast<float>(j) / half_dh));
 
-            ((uint16_t *)table)[i * half_dh + j] = f32_to_f16(_sin);
+            if (dtype == INFINI_DTYPE_F16) {
+                ((uint16_t *)table)[i * half_dh + j] = f32_to_f16(_sin);
+            } else if (dtype == INFINI_DTYPE_BF16) {
+                ((uint16_t *)table)[i * half_dh + j] = f32_to_bf16(_sin);
+            } else if (dtype == INFINI_DTYPE_F32) {
+                ((float *)table)[i * half_dh + j] = _sin;
+            } else {
+                std::cout << "Sin table unsupported dtype" << std::endl;
+                std::abort();
+            }
         }
     }
     auto shape = std::vector<size_t>({dctx, half_dh});
-    auto tensor = Tensor::weight(table, INFINI_DTYPE_F16, shape);
+    auto tensor = Tensor::weight(table, dtype, shape);
     std::free(table);
     return tensor;
 }
 
-inline std::shared_ptr<Tensor> getCosTable(size_t dctx, size_t dh, float theta) {
-    auto half_dh = dh / 2;
-    auto unit = dsize(INFINI_DTYPE_F16);
+inline std::shared_ptr<Tensor> getCosTable(size_t dctx, size_t dh, float theta, infiniDtype_t dtype) {
+    auto half_dh = dh / 4; // 2D MRoPE: table_dim = dhead / 4
+    auto unit = dsize(dtype);
     void *table = std::malloc(dctx * half_dh * unit);
 
     for (size_t i = 0; i < dctx; i++) {
@@ -31,11 +40,20 @@ inline std::shared_ptr<Tensor> getCosTable(size_t dctx, size_t dh, float theta) 
             float _cos = std::cos(
                 static_cast<float>(i) / std::pow(theta, static_cast<float>(j) / half_dh));
 
-            ((uint16_t *)table)[i * half_dh + j] = f32_to_f16(_cos);
+            if (dtype == INFINI_DTYPE_F16) {
+                ((uint16_t *)table)[i * half_dh + j] = f32_to_f16(_cos);
+            } else if (dtype == INFINI_DTYPE_BF16) {
+                ((uint16_t *)table)[i * half_dh + j] = f32_to_bf16(_cos);
+            } else if (dtype == INFINI_DTYPE_F32) {
+                ((float *)table)[i * half_dh + j] = _cos;
+            } else {
+                std::cout << "Cos table unsupported dtype" << std::endl;
+                std::abort();
+            }
         }
     }
     auto shape = std::vector<size_t>({dctx, half_dh});
-    auto tensor = Tensor::weight(table, INFINI_DTYPE_F16, shape);
+    auto tensor = Tensor::weight(table, dtype, shape);
     std::free(table);
     return tensor;
 }
@@ -80,8 +98,8 @@ Qwen3VLWeights::Qwen3VLWeights(
         this->register_weight("lm_head.weight", w_out_embd, i);
         weight->w_out_embd = w_out_embd;
 
-        weight->sin_table = getSinTable(dctx, dh, meta->theta);
-        weight->cos_table = getCosTable(dctx, dh, meta->theta);
+        weight->sin_table = getSinTable(dctx, dh, meta->theta, dt_logits);
+        weight->cos_table = getCosTable(dctx, dh, meta->theta, dt_logits);
 
 #define REGISTER_LAYER_WEIGHT_1D(W_NAME, W_VAR, W_DIM, W_DTYPE, W_DIST_TYPE)                     \
     auto W_VAR = Tensor::weight(nullptr, W_DTYPE, {W_DIM});                                      \

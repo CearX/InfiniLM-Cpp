@@ -8,6 +8,8 @@ import time
 import json
 import torch
 import transformers
+import numpy as np
+from PIL import Image
 
 from libinfinicore_infer import (
     Qwen3VLModel,
@@ -21,6 +23,146 @@ from infer_task import InferTask, KVCache
 from ctypes import POINTER, c_float, c_int, c_uint, c_void_p, byref
 
 torch.set_default_device("cpu")
+
+
+def smart_resize(height: int, width: int, factor: int = 28, min_pixels: int = 56 * 56, max_pixels: int = 14 * 14 * 4 * 1280):
+    """基于 transformers 的 smart_resize 实现"""
+    import math
+    if max(height, width) / min(height, width) > 200:
+        raise ValueError(f"aspect ratio too large: {max(height, width) / min(height, width)}")
+
+    h_bar = round(height / factor) * factor
+    w_bar = round(width / factor) * factor
+
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = max(factor, math.floor(height / beta / factor) * factor)
+        w_bar = max(factor, math.floor(width / beta / factor) * factor)
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = math.ceil(height * beta / factor) * factor
+        w_bar = math.ceil(width * beta / factor) * factor
+
+    return h_bar, w_bar
+
+
+def preprocess_image_qwen3vl(image_path: str):
+    """
+    完整的 Qwen3-VL 图像预处理流程
+    基于 transformers 的实现：加载→resize→rescale→normalize→CHW→reshape→permute→flatten
+    """
+    # 配置参数 (从 Qwen3-VL config 中获取)
+    patch_size = 16
+    merge_size = 2  # spatial_merge_size
+    temporal_patch_size = 2
+    factor = patch_size * merge_size  # 28
+    min_pixels = 4 * 28 * 28
+    max_pixels = 16384 * 28 * 28
+
+    # 1. 加载图像
+    image = Image.open(image_path).convert('RGB')
+    height, width = image.size[1], image.size[0]  # PIL: (width, height)
+
+    # 2. Smart resize (保持宽高比，满足像素数和因子整除要求)
+    resized_height, resized_width = smart_resize(height, width, factor, min_pixels, max_pixels)
+    image = image.resize((resized_width, resized_height), Image.BILINEAR)
+
+    print(f"图像预处理: {width}×{height} -> {resized_width}×{resized_height}")
+
+    # 3. 转换为张量
+    patches = torch.tensor(np.array(image)).float()
+
+    # 4. Rescale (0-255 -> 0-1)
+    patches = patches / 255.0
+
+    # 5. Normalize (ImageNet 标准)
+    mean = torch.tensor([0.485, 0.456, 0.406])
+    std = torch.tensor([0.229, 0.224, 0.225])
+    patches = (patches - mean) / std
+
+    # 6. CHW 调整: [H, W, C] -> [C, H, W]
+    patches = patches.permute(2, 0, 1)
+
+    # 7. 添加 batch 和时间维度 [C, H, W] -> [1, C, H, W] (模拟单帧)
+    patches = patches.unsqueeze(0)
+
+    # 8. Temporal padding (确保帧数能被 temporal_patch_size 整除)
+    if patches.shape[0] % temporal_patch_size != 0:
+        repeats = patches[-1:].repeat(temporal_patch_size - patches.shape[0] % temporal_patch_size, 1, 1, 1)
+        patches = torch.cat([patches, repeats], dim=0)
+
+    # 9. Grid 计算
+    channel = patches.shape[1]
+    grid_t = patches.shape[0] // temporal_patch_size
+    grid_h, grid_w = resized_height // patch_size, resized_width // patch_size
+
+    # 9. Reshape 和 Permute (按照 transformers 实现)
+    patches = patches.view(
+        grid_t,
+        temporal_patch_size,
+        channel,
+        grid_h // merge_size,
+        merge_size,
+        patch_size,
+        grid_w // merge_size,
+        merge_size,
+        patch_size,
+    )
+    patches = patches.permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
+
+    # 10. Flatten
+    flatten_patches = patches.reshape(
+        grid_t * grid_h * grid_w, channel * temporal_patch_size * patch_size * patch_size
+    )
+
+    # Grid_thw (注意：这里是原始的 grid 大小，不是 merge 后的)
+    grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.int32)
+
+    return flatten_patches, grid_thw
+
+
+def compute_2d_mrope_pos_ids(grid_thw: torch.Tensor, spatial_merge_size: int = 2):
+    """
+    计算 2D MRoPE 的 pos_ids，基于 vLLM 的实现
+
+    Args:
+        grid_thw: [batch, 3] 张量，包含 [t, h, w] (原始 grid 大小)
+        spatial_merge_size: 空间合并大小，默认2
+
+    Returns:
+        pos_ids: [num_patches, 2] 张量，包含 [h_pos, w_pos] 坐标
+    """
+    pos_ids_list = []
+
+    for t, h, w in grid_thw:
+        t, h, w = int(t), int(h), int(w)
+
+        # 按照 vLLM 的 rot_pos_emb 实现，考虑 spatial_merge_size
+        # 生成高度位置索引
+        hpos_ids = torch.arange(h).unsqueeze(1).expand(-1, w)
+        hpos_ids = hpos_ids.reshape(
+            h // spatial_merge_size,
+            spatial_merge_size,
+            w // spatial_merge_size,
+            spatial_merge_size,
+        )
+        hpos_ids = hpos_ids.permute(0, 2, 1, 3).flatten()
+
+        # 生成宽度位置索引
+        wpos_ids = torch.arange(w).unsqueeze(0).expand(h, -1)
+        wpos_ids = wpos_ids.reshape(
+            h // spatial_merge_size,
+            spatial_merge_size,
+            w // spatial_merge_size,
+            spatial_merge_size,
+        )
+        wpos_ids = wpos_ids.permute(0, 2, 1, 3).flatten()
+
+        # 组合坐标并重复时间维度
+        pos_ids = torch.stack([hpos_ids, wpos_ids], dim=-1).repeat(t, 1)
+        pos_ids_list.append(pos_ids)
+
+    return torch.cat(pos_ids_list, dim=0)
 
 
 class Qwen3VLMetaFromConfig(Qwen3VLMetaCStruct):
@@ -83,14 +225,70 @@ class Qwen3VLBatchedTask:
         self.topks_list = [t.topk for t in tasks]
         self.topps_list = [t.topp for t in tasks]
 
-        # Flatten token lists
+        # Flatten token lists - 对于 ViT，tokens 实际上是 patch embeddings
         flat_tokens = [tok for toks in token_lists for tok in toks]
-        self.ntok = len(flat_tokens)
+
+        # 对于 ViT：如果有图像输入，ntok 应该是 patch 数量而不是 token 数量
+        if any(any(token >= 151652 and token <= 151656 for token in task.tokens) for task in tasks):
+            # 计算图像的 patch 数量
+            try:
+                image_path = "/home/cearx/qy/model/Qwen3-VL-2B-Vit-86M-0828/image3.jpg"
+                pixel_values, grid_thw = preprocess_image_qwen3vl(image_path)
+                self.ntok = pixel_values.shape[0]  # patch 数量
+            except:
+                self.ntok = len(flat_tokens)  # 回退到 token 数量
+        else:
+            self.ntok = len(flat_tokens)
+
+        # 实现 2D MRoPE pos_ids 计算
+        # 集成图像 pos_ids 到批处理中
+        flat_pos_ids = []
+        self.has_vision = False  # 默认无视觉输入
+        self.vision_pos_shape = None
+
+        for task in tasks:
+            # 检查是否有图像输入（简单检测：如果 tokens 中包含图像 token）
+            has_image = any(token >= 151652 and token <= 151656 for token in task.tokens)  # Qwen3VL 图像 token 范围
+
+            if has_image:
+                # 为图像任务计算真实的 2D MRoPE pos_ids
+                try:
+                    # 使用测试图像计算 pos_ids (实际应用中需要真实图像)
+                    image_path = "/home/cearx/qy/model/Qwen3-VL-2B-Vit-86M-0828/image3.jpg"
+                    _, grid_thw = preprocess_image_qwen3vl(image_path)
+                    pos_ids = compute_2d_mrope_pos_ids(grid_thw)
+
+                    # 保持 2D 结构: 需要与 C++ 算子的期望格式匹配
+                    # 将 pos_ids 展开为 [h1, w1, h2, w2, ...] 格式
+                    for pos in pos_ids:
+                        flat_pos_ids.extend([int(pos[0]), int(pos[1])])
+
+                    # 记录图像的维度信息，供 C++ 端重构 2D 张量
+                    self.has_vision = True
+                    self.vision_pos_shape = pos_ids.shape  # [num_patches, 2]
+
+                except Exception as e:
+                    print(f"警告: 图像 pos_ids 计算失败，使用默认值: {e}")
+                    # 回退到文本模式
+                    for i in range(len(task.tokens)):
+                        flat_pos_ids.extend([i, 0])
+            else:
+                # 纯文本任务：使用传统的 1D 位置编码
+                for i in range(len(task.tokens)):
+                    flat_pos_ids.extend([i, 0])  # [位置, 0] 表示文本位置
+
+        self.pos_ids_len = len(flat_pos_ids)
 
         # Convert to ctypes arrays in one pass
-        self.tokens = (c_uint * self.ntok)(*flat_tokens)
+        if self.has_vision:
+            # 对于 ViT：创建虚拟的 patch token IDs (使用图像 token ID)
+            patch_tokens = [151654] * self.ntok  # 使用图像 token ID
+            self.tokens = (c_uint * self.ntok)(*patch_tokens)
+        else:
+            self.tokens = (c_uint * self.ntok)(*flat_tokens)
         self.req_lens = (c_uint * self.nreq)(*self.req_lens_list)
         self.req_pos = (c_uint * self.nreq)(*self.req_pos_list)
+        self.pos_ids = (c_uint * max(1, self.pos_ids_len))(*([0] + flat_pos_ids)[:max(1, self.pos_ids_len)])
         self.kv_caches = (POINTER(KVCacheCStruct) *
                           self.nreq)(*self.kv_cache_ptrs)
         self.temperaturas = (c_float * self.nreq)(*self.temperaturas_list)
@@ -104,11 +302,21 @@ class Qwen3VLBatchedTask:
             self.req_lens,
             self.nreq,
             self.req_pos,
+            self.pos_ids,
+            self.pos_ids_len,
             self.kv_caches,
             self.temperaturas,
             self.topks,
             self.topps,
         )
+
+    def get_vision_info(self):
+        """获取视觉相关的信息，供 C++ 端使用"""
+        return {
+            'has_vision': getattr(self, 'has_vision', False),
+            'vision_pos_shape': getattr(self, 'vision_pos_shape', None),
+            'pos_ids_should_be_2d': getattr(self, 'has_vision', False)
+        }
 
 
 class Qwen3VLForCausalLM:
@@ -343,10 +551,77 @@ def test():
         )
         sys.exit(1)
 
+    # 首先测试 pos_ids 计算
+    # test_pos_ids_calculation()
+
     ndev = int(sys.argv[3]) if len(sys.argv) > 3 else 1
-    model = Qwen3VLForCausalLM(model_path, device_type, ndev)
+    max_tokens = 1024
+    model = Qwen3VLForCausalLM(model_path, device_type, ndev, max_tokens=max_tokens)
     model.generate("山东最高的山是？", 500)
     model.destroy_model_instance()
+
+
+def test_pos_ids_calculation():
+    """测试 2D MRoPE pos_ids 计算"""
+    print("=== 测试 2D MRoPE pos_ids 计算 ===")
+
+    # 测试图像路径
+    image_path = "/home/cearx/qy/model/Qwen3-VL-2B-Vit-86M-0828/image3.jpg"
+
+    try:
+        # 预处理图像
+        pixel_values, grid_thw = preprocess_image_qwen3vl(image_path)
+        print(f"图像预处理完成:")
+        print(f"  pixel_values shape: {pixel_values.shape}")
+        print(f"  grid_thw: {grid_thw}")
+
+        # 计算 pos_ids
+        pos_ids = compute_2d_mrope_pos_ids(grid_thw)
+        print(f"pos_ids 计算完成:")
+        print(f"  pos_ids shape: {pos_ids.shape}")
+        print(f"  pos_ids 前10个元素:")
+        print(f"  {pos_ids[:10]}")
+        print(f"  pos_ids 最后10个元素:")
+        print(f"  {pos_ids[-10:]}")
+
+        # 验证 pos_ids 的合理性
+        t, h, w = grid_thw[0].tolist()
+        # grid_thw 现在已经是 spatial merge 后的网格大小
+        expected_patches = t * h * w
+        actual_patches = pos_ids.shape[0]
+        print(f"期望 patch 数量: {expected_patches}")
+        print(f"实际 patch 数量: {actual_patches}")
+
+        # 检查 pos_ids 的值范围
+        h_max = pos_ids[:, 0].max().item()
+        w_max = pos_ids[:, 1].max().item()
+        print(f"pos_ids 高度范围: 0 到 {h_max}")
+        print(f"pos_ids 宽度范围: 0 到 {w_max}")
+
+        # 坐标范围应该对应 grid_thw 的范围
+        expected_h_max = h - 1
+        expected_w_max = w - 1
+        print(f"预期高度范围: 0 到 {expected_h_max}")
+        print(f"预期宽度范围: 0 到 {expected_w_max}")
+
+        if expected_patches == actual_patches:
+            print("✓ pos_ids 数量验证通过!")
+        else:
+            print("✗ pos_ids 数量验证失败!")
+            print(f"  详细信息: grid_thw={grid_thw}, 期望={expected_patches}, 实际={actual_patches}")
+
+        # 检查坐标范围是否正确
+        if h_max == expected_h_max and w_max == expected_w_max:
+            print("✓ pos_ids 坐标范围验证通过!")
+        else:
+            print("✗ pos_ids 坐标范围验证失败!")
+            print(f"  实际坐标最大值: h={h_max}, w={w_max}")
+            print(f"  期望坐标最大值: h={expected_h_max}, w={expected_w_max}")
+
+    except Exception as e:
+        print(f"测试失败: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":

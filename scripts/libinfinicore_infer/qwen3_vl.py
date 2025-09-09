@@ -86,6 +86,8 @@ class Qwen3VLModel(BaseModel):
             POINTER(c_uint),
             c_uint,
             POINTER(c_uint),
+            POINTER(c_uint),
+            c_uint,
             POINTER(POINTER(KVCacheCStruct)),
             POINTER(c_float),
             POINTER(c_uint),
@@ -100,6 +102,8 @@ class Qwen3VLModel(BaseModel):
             POINTER(c_uint),
             c_uint,
             POINTER(c_uint),
+            POINTER(c_uint),
+            c_uint,
             POINTER(POINTER(KVCacheCStruct)),
             c_void_p,
         ]
@@ -140,6 +144,8 @@ class Qwen3VLModel(BaseModel):
         req_lens,
         nreq,
         req_pos,
+        pos_ids,
+        pos_ids_len,
         kv_caches,
         temperature,
         topk,
@@ -153,6 +159,8 @@ class Qwen3VLModel(BaseModel):
             req_lens,
             nreq,
             req_pos,
+            pos_ids,
+            pos_ids_len,
             kv_caches,
             temperature,
             topk,
@@ -161,8 +169,8 @@ class Qwen3VLModel(BaseModel):
         )
 
     def forward_batch(
-        self, model, tokens, ntok, req_lens, nreq, req_pos, kv_caches, logits
+        self, model, tokens, ntok, req_lens, nreq, req_pos, pos_ids, pos_ids_len, kv_caches, logits
     ):
         self.lib.forwardBatchQwen3VL(
-            model, tokens, ntok, req_lens, nreq, req_pos, kv_caches, logits
+            model, tokens, ntok, req_lens, nreq, req_pos, pos_ids, pos_ids_len, kv_caches, logits
         )
