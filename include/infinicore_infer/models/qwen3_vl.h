@@ -64,6 +64,7 @@ inferBatchQwen3VL(struct Qwen3VLModel *,
                   const uint32_t *tokens, uint32_t ntok,
                   const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
                   const uint32_t *pos_ids, uint32_t pos_ids_len,
+                  const float *pixel_values,
                   struct KVCache **kv_caches,
                   const float *temperature, const uint32_t *topk, const float *topp,
                   uint32_t *output);
@@ -81,6 +82,7 @@ forwardBatchQwen3VL(struct Qwen3VLModel *,
                     const uint32_t *tokens, uint32_t ntok,
                     const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
                     const uint32_t *pos_ids, uint32_t pos_ids_len,
+                    const float *pixel_values,
                     struct KVCache **kv_caches,
                     void *logits);
 

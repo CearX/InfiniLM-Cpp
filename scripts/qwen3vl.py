@@ -212,7 +212,7 @@ class Qwen3VLMetaFromConfig(Qwen3VLMetaCStruct):
 
 
 class Qwen3VLBatchedTask:
-    def __init__(self, tasks: List[InferTask]):
+    def __init__(self, tasks: List[InferTask], image_path: str | None = None, config: dict | None = None):
         self.tasks = tasks
         self.nreq = len(tasks)
 
@@ -228,22 +228,42 @@ class Qwen3VLBatchedTask:
         # Flatten token lists - 对于 ViT，tokens 实际上是 patch embeddings
         flat_tokens = [tok for toks in token_lists for tok in toks]
 
-        # 对于 ViT：如果有图像输入，ntok 应该是 patch 数量而不是 token 数量
-        if any(any(token >= 151652 and token <= 151656 for token in task.tokens) for task in tasks):
-            # 计算图像的 patch 数量，同时保存 pixel_values 供后续使用
+        # 统一：ntok 始终为文本 token 数；pixel_values 仅在 prefill(首轮，pos==0) 且有图像时提供
+        self.ntok = len(flat_tokens)
+        self.pixel_values = None
+        self.patch_dim = 0
+        self.grid_thw = None
+        self.image_path = image_path
+        # 从config中读取image/video token id（若存在）
+        self.image_token_id = None
+        self.video_token_id = None
+        if isinstance(config, dict):
+            self.image_token_id = config.get("image_token_id", None)
+            self.video_token_id = config.get("video_token_id", None)
+        # prefill 判断：仅当该 batch 中存在 pos==0 的请求且包含图像占位符时，计算像素与pos_ids
+        any_prefill_with_image = False
+        def is_image_tok(tid: int) -> bool:
+            if self.image_token_id is not None:
+                try:
+                    return tid == int(self.image_token_id)
+                except Exception:
+                    pass
+            return 151652 <= tid <= 151656
+
+        for task in tasks:
+            if task.pos == 0 and any(is_image_tok(token) for token in task.tokens):
+                any_prefill_with_image = True
+                break
+        if any_prefill_with_image:
             try:
-                image_path = "/home/cearx/qy/model/Qwen3-VL-2B-Vit-86M-0828/image3.jpg"
-                self.pixel_values, grid_thw = preprocess_image_qwen3vl(image_path)
-                self.ntok = self.pixel_values.shape[0]  # patch 数量
-                self.patch_dim = self.pixel_values.shape[1]  # patch 特征维度
-            except:
-                self.ntok = len(flat_tokens)  # 回退到 token 数量
+                if self.image_path is None:
+                    raise RuntimeError("image_path is None for prefill with vision input")
+                self.pixel_values, self.grid_thw = preprocess_image_qwen3vl(self.image_path)
+                self.patch_dim = self.pixel_values.shape[1]
+            except Exception as _e:
                 self.pixel_values = None
+                self.grid_thw = None
                 self.patch_dim = 0
-        else:
-            self.ntok = len(flat_tokens)
-            self.pixel_values = None
-            self.patch_dim = 0
 
         # 实现 2D MRoPE pos_ids 计算
         # 集成图像 pos_ids 到批处理中
@@ -251,46 +271,27 @@ class Qwen3VLBatchedTask:
         self.has_vision = False  # 默认无视觉输入
         self.vision_pos_shape = None
 
-        for task in tasks:
-            # 检查是否有图像输入（简单检测：如果 tokens 中包含图像 token）
-            has_image = any(token >= 151652 and token <= 151656 for token in task.tokens)  # Qwen3VL 图像 token 范围
-
-            if has_image:
-                # 为图像任务计算真实的 2D MRoPE pos_ids
-                try:
-                    # 使用测试图像计算 pos_ids (实际应用中需要真实图像)
-                    image_path = "/home/cearx/qy/model/Qwen3-VL-2B-Vit-86M-0828/image3.jpg"
-                    _, grid_thw = preprocess_image_qwen3vl(image_path)
-                    pos_ids = compute_2d_mrope_pos_ids(grid_thw)
-
-                    # 保持 2D 结构: 需要与 C++ 算子的期望格式匹配
-                    # 将 pos_ids 展开为 [h1, w1, h2, w2, ...] 格式
-                    for pos in pos_ids:
-                        flat_pos_ids.extend([int(pos[0]), int(pos[1])])
-
-                    # 记录图像的维度信息，供 C++ 端重构 2D 张量
-                    self.has_vision = True
-                    self.vision_pos_shape = pos_ids.shape  # [num_patches, 2]
-
-                except Exception as e:
-                    print(f"警告: 图像 pos_ids 计算失败，使用默认值: {e}")
-                    # 回退到文本模式
-                    for i in range(len(task.tokens)):
-                        flat_pos_ids.extend([i, 0])
-            else:
-                # 纯文本任务：使用传统的 1D 位置编码
-                for i in range(len(task.tokens)):
-                    flat_pos_ids.extend([i, 0])  # [位置, 0] 表示文本位置
+        if any_prefill_with_image and getattr(self, 'pixel_values', None) is not None and getattr(self, 'grid_thw', None) is not None:
+            try:
+                pos_ids = compute_2d_mrope_pos_ids(self.grid_thw)
+                for pos in pos_ids:
+                    flat_pos_ids.extend([int(pos[0]), int(pos[1])])
+                self.has_vision = True
+                self.vision_pos_shape = pos_ids.shape
+            except Exception as e:
+                print(f"警告: 图像 pos_ids 计算失败，prefill 将降级为纯文本: {e}")
+                self.has_vision = False
+        else:
+            # 纯文本或decode：为每个token提供简化pos_ids，避免C端空指针
+            for toks in token_lists:
+                for i in range(len(toks)):
+                    flat_pos_ids.extend([i, 0])
+            self.has_vision = False
 
         self.pos_ids_len = len(flat_pos_ids)
 
         # Convert to ctypes arrays in one pass
-        if self.has_vision:
-            # 对于 ViT：创建虚拟的 patch token IDs (使用图像 token ID)
-            patch_tokens = [151654] * self.ntok  # 使用图像 token ID
-            self.tokens = (c_uint * self.ntok)(*patch_tokens)
-        else:
-            self.tokens = (c_uint * self.ntok)(*flat_tokens)
+        self.tokens = (c_uint * self.ntok)(*flat_tokens)
         self.req_lens = (c_uint * self.nreq)(*self.req_lens_list)
         self.req_pos = (c_uint * self.nreq)(*self.req_pos_list)
         self.pos_ids = (c_uint * max(1, self.pos_ids_len))(*([0] + flat_pos_ids)[:max(1, self.pos_ids_len)])
@@ -301,6 +302,14 @@ class Qwen3VLBatchedTask:
         self.topps = (c_float * self.nreq)(*self.topps_list)
 
     def input_args(self):
+        # pixel_values 作为裸指针传递；无视觉输入则传空指针
+        if getattr(self, 'pixel_values', None) is not None:
+            # 确保是连续内存
+            pv = self.pixel_values.contiguous()
+            pixel_values_ptr = c_void_p(int(pv.data_ptr()))
+        else:
+            pixel_values_ptr = c_void_p(0)
+
         return (
             self.tokens,
             self.ntok,
@@ -309,6 +318,7 @@ class Qwen3VLBatchedTask:
             self.req_pos,
             self.pos_ids,
             self.pos_ids_len,
+            pixel_values_ptr,
             self.kv_caches,
             self.temperaturas,
             self.topks,
@@ -325,13 +335,6 @@ class Qwen3VLBatchedTask:
 
 
 class Qwen3VLForCausalLM:
-    """
-    双模块架构：ViT 模块 + LLM 模块
-
-    工作流程：
-    1. Image → Python 预处理 → ViT 模块(C++) → visual_embeddings
-    2. Text + visual_embeddings → LLM 模块(C++) → output
-    """
     def __init__(self, model_dir_path, device=DeviceType.DEVICE_TYPE_CPU, ndev=1, max_tokens=None):
         load_start_time = time.time()
         print(f"Creating model on {ndev} devices...")
@@ -415,9 +418,9 @@ class Qwen3VLForCausalLM:
     def drop_kv_cache(self, kv_cache):
         self.qwen3vl_model.drop_kv_cache(kv_cache)
 
-    def batch_infer_one_round(self, tasks: List[InferTask]):
+    def batch_infer_one_round(self, tasks: List[InferTask], image_path: str | None = None):
         output = (c_uint * len(tasks))()
-        batch_inputs = Qwen3VLBatchedTask(tasks)
+        batch_inputs = Qwen3VLBatchedTask(tasks, image_path=image_path, config=self.config)
         self.qwen3vl_model.infer_batch(
             self.model_instance,
             *(batch_inputs.input_args()),
@@ -470,7 +473,8 @@ class Qwen3VLForCausalLM:
 
         for step_i in range(max_steps):
             start_time = time.time()
-            output_tokens = self.batch_infer_one_round([infer_task])
+            # prefill: step 0，传入image_path；decode：后续步不传
+            output_tokens = self.batch_infer_one_round([infer_task], image_path=image_path if step_i == 0 else None)
             end_time = time.time()
             steps += 1
             # output_str = (
@@ -496,11 +500,7 @@ class Qwen3VLForCausalLM:
         return output_content, avg_time
 
     def perplexity(self, test_sequences: List[Sequence[int]], batch_size=10):
-        tasks = [
-            InferTask(i, [], self.max_context_len(),
-                      1.0, 1, 1.0, self.eos_token_id)
-            for i in range(batch_size)
-        ]
+        tasks = [InferTask(i, [], self.max_context_len(), 1.0, 1, 1.0, self.eos_token_id) for i in range(batch_size)]
         kv_caches = [KVCache(self) for _ in range(batch_size)]
 
         nll = 0.0
@@ -516,10 +516,11 @@ class Qwen3VLForCausalLM:
                 tasks[batch_id].bind_kvcache(kv_caches[batch_id])
                 batch_id += 1
 
-            batch_inputs = Qwen3VLBatchedTask(tasks[:batch_id])
+            batch_inputs = Qwen3VLBatchedTask(tasks[:batch_id], image_path=None, config=self.config)
             logits = torch.zeros(
                 (batch_inputs.ntok, self.meta.dvoc), dtype=self.meta.torch_dtype_logits
             )
+            # 评测路径：decode阶段不传像素；传递pos_ids以保持mrope输入稳定
             self.qwen3vl_model.forward_batch(
                 self.model_instance,
                 batch_inputs.tokens,
@@ -527,6 +528,9 @@ class Qwen3VLForCausalLM:
                 batch_inputs.req_lens,
                 batch_inputs.nreq,
                 batch_inputs.req_pos,
+                batch_inputs.pos_ids,
+                batch_inputs.pos_ids_len,
+                c_void_p(0),
                 batch_inputs.kv_caches,
                 logits.data_ptr(),
             )
@@ -589,7 +593,8 @@ def test():
     ndev = int(sys.argv[3]) if len(sys.argv) > 3 else 1
     max_tokens = 1024
     model = Qwen3VLForCausalLM(model_path, device_type, ndev, max_tokens=max_tokens)
-    model.generate("山东最高的山是？", 500)
+    image_path = "/home/cearx/qy/model/Qwen3-VL-2B-Vit-86M-0828/image3.jpg"
+    model.generate("山东最高的山是？", 500, image_path=image_path)
     model.destroy_model_instance()
 
 

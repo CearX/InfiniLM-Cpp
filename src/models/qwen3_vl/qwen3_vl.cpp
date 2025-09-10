@@ -50,7 +50,7 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
                       const uint32_t *tokens, uint32_t ntok,
                       const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
                       const uint32_t *pos_ids, uint32_t pos_ids_len,
-                      const float *pixel_values, uint32_t is_vision_mode, // 新增：视觉数据和模式标志
+                      const float *pixel_values, uint32_t /*is_vision_mode*/, // 视觉数据指针，是否视觉模式不再需要
                       struct KVCache **kv_caches,
                       const float *temperature, const uint32_t *topk, const float *topp,
                       uint32_t *output, void *last_logits) {
@@ -93,89 +93,76 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
         req_start += req_lens[req];
     }
 
+    // printf("here1\n");
+
+    // 统一路径：若有视觉输入，先跑ViT得到visual_embeds；随后构建logits_in（视觉token用visual_embeds替换）
     std::shared_ptr<Tensor> pos_ids_buf;
-    // ViT 部分：直接使用传入的 pos_ids，reshape 为 2D [num_patches, 2]
-    uint32_t num_patches = pos_ids_len / 2; // 扁平数组长度 / 2 = patch 数量
-    if (rsrc.device == INFINI_DEVICE_CPU) {
-        pos_ids_buf = Tensor::weight(const_cast<uint32_t *>(pos_ids), INFINI_DTYPE_U32, {num_patches, 2});
-    } else {
-        pos_ids_buf = Tensor::buffer(INFINI_DTYPE_U32, {num_patches, 2}, rsrc.memory_pool);
-        RUN_INFINI(infinirtMemcpyAsync(pos_ids_buf->data(), pos_ids, sizeof(uint32_t) * pos_ids_len,
-                                       INFINIRT_MEMCPY_H2D, stream));
-    }
-    // 双模块架构：ViT 模块 vs LLM 模块
-    if (is_vision_mode) {
-        // === ViT 模块 ===
-        // Patch Embedding: pixel_values [ntok, patch_feature_dim] -> [ntok, hidden_size]
-        if (pixel_values != nullptr) {
-            // 🚀 实现真正的 3D Conv Patch Embedding (InfiniCore)
-            // 根据配置: patch_size=16, temporal_patch_size=2, in_channels=3, hidden_size=768
-            // vLLM: Conv3d(3, 768, kernel=(2,16,16), stride=(2,16,16))
-
-            // 从权重形状确定实际参数: [768, 3, 2, 16, 16]
-            uint32_t in_channels = 3;
-            uint32_t temporal_patch_size = 2;
-            uint32_t patch_size = 16;          // 根据权重注释确认
-            uint32_t vision_hidden_size = 768; // ViT hidden_size
-            uint32_t patch_feature_dim = in_channels * temporal_patch_size * patch_size * patch_size;
-
-            // 创建输入张量: [ntok, patch_feature_dim] -> view -> [ntok, 3, 2, 16, 16]
-            std::shared_ptr<Tensor> pixel_values_buf;
-            if (rsrc.device == INFINI_DEVICE_CPU) {
-                pixel_values_buf = Tensor::weight(const_cast<float *>(pixel_values), dt_logits,
-                                                  {ntok, in_channels, temporal_patch_size, patch_size, patch_size});
-            } else {
-                pixel_values_buf = Tensor::buffer(dt_logits, {ntok, in_channels, temporal_patch_size, patch_size, patch_size}, rsrc.memory_pool);
-                RUN_INFINI(infinirtMemcpyAsync(pixel_values_buf->data(), pixel_values,
-                                               sizeof(float) * ntok * patch_feature_dim,
-                                               INFINIRT_MEMCPY_H2D, stream));
-            }
-
-            // 创建输出张量: [ntok, vision_hidden_size, 1, 1, 1] -> flatten -> [ntok, vision_hidden_size]
-            auto conv_output = Tensor::buffer(dt_logits, {ntok, vision_hidden_size, 1, 1, 1}, rsrc.memory_pool);
-
-            // 🚀 调用 InfiniCore Conv3D 算子 (通过 inference_context)
-            // Conv3d: input[ntok,3,2,16,16] * weight[768,3,2,16,16] + bias[768] -> output[ntok,768,1,1,1]
-
-            // 3D 卷积参数: pads=(0,0,0), strides=(2,16,16), dilations=(1,1,1)
-            std::vector<int64_t> pads = {0, 0, 0};
-            std::vector<int64_t> strides = {temporal_patch_size, patch_size, patch_size};
-            std::vector<int64_t> dilations = {1, 1, 1};
-
-            // 执行 3D 卷积 (自动处理缓存和工作空间)
-            conv3d(conv_output,                     // output: [ntok, 768, 1, 1, 1]
-                   pixel_values_buf,                // input:  [ntok, 3, 2, 16, 16]
-                   weight->w_v_patch_embed_proj[0], // weight: [768, 3, 2, 16, 16]
-                   weight->b_v_patch_embed_proj[0], // bias:   [768]
-                   pads, strides, dilations);
-
-            // Reshape输出: [ntok, 768, 1, 1, 1] -> [ntok, 768]
-            auto flattened_output = conv_output->view({ntok, vision_hidden_size});
-            RUN_INFINI(infinirtMemcpyAsync(logits_in->data(), flattened_output->data(),
-                                           sizeof(float) * ntok * vision_hidden_size,
-                                           INFINIRT_MEMCPY_D2D, stream));
-
-            printf("[ViT] 真正的 Conv3D Patch Embedding: [%u, %u, %u, %u, %u] -> [%u, %u]\n",
-                   ntok, in_channels, temporal_patch_size, patch_size, patch_size, ntok, vision_hidden_size);
-        }
-    } else {
-        // === LLM 模块 ===
-        // Text Embedding: token_ids -> embeddings (包括视觉 token 替换)
-        for (uint32_t i = 0; i < ntok; i++) {
-            if (tokens[i] >= 151652 && tokens[i] <= 151656) {
-                // 图像 token：需要替换为预计算的视觉 embedding
-                // TODO: 从 visual_embeddings 中取对应的 embedding
-                RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),
-                                               weight->w_in_embd->data(tokens[i] * d),
-                                               dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
-            } else {
-                // 普通文本 token：直接 embedding lookup
-                RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),
-                                               weight->w_in_embd->data(tokens[i] * d),
-                                               dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
-            }
+    uint32_t num_patches = (pos_ids_len >= 2) ? (pos_ids_len / 2) : 0;
+    if (pos_ids != nullptr && num_patches > 0) {
+        if (rsrc.device == INFINI_DEVICE_CPU) {
+            pos_ids_buf = Tensor::weight(const_cast<uint32_t *>(pos_ids), INFINI_DTYPE_U32, {num_patches, 2});
+        } else {
+            pos_ids_buf = Tensor::buffer(INFINI_DTYPE_U32, {num_patches, 2}, rsrc.memory_pool);
+            RUN_INFINI(infinirtMemcpyAsync(pos_ids_buf->data(), pos_ids, sizeof(uint32_t) * pos_ids_len,
+                                           INFINIRT_MEMCPY_H2D, stream));
         }
     }
+
+    // printf("here2\n");
+
+    std::shared_ptr<Tensor> visual_embeds; // [num_patches, d]
+    const bool has_vision = (pixel_values != nullptr) && (num_patches > 0);
+    if (has_vision) {
+        // 根据权重形状确定实际参数: [vision_hidden_size, 3, temporal, patch, patch]
+        uint32_t in_channels = 3;
+        uint32_t temporal_patch_size = 2;
+        uint32_t patch_size = 16;
+        uint32_t vision_hidden_size = d; // 直接对齐到文本hidden size，便于拼接
+        uint32_t patch_feature_dim = in_channels * temporal_patch_size * patch_size * patch_size;
+
+        // 输入像素: [num_patches, 3, 2, 16, 16]
+        std::shared_ptr<Tensor> pixel_values_buf;
+        if (rsrc.device == INFINI_DEVICE_CPU) {
+            pixel_values_buf = Tensor::weight(const_cast<float *>(pixel_values), dt_logits,
+                                              {num_patches, in_channels, temporal_patch_size, patch_size, patch_size});
+        } else {
+            pixel_values_buf = Tensor::buffer(dt_logits, {num_patches, in_channels, temporal_patch_size, patch_size, patch_size}, rsrc.memory_pool);
+            RUN_INFINI(infinirtMemcpyAsync(pixel_values_buf->data(), pixel_values,
+                                           sizeof(float) * num_patches * patch_feature_dim,
+                                           INFINIRT_MEMCPY_H2D, stream));
+        }
+
+        auto conv_output = Tensor::buffer(dt_logits, {num_patches, vision_hidden_size, 1, 1, 1}, rsrc.memory_pool);
+        std::vector<int64_t> pads = {0, 0, 0};
+        std::vector<int64_t> strides = {int64_t(temporal_patch_size), int64_t(patch_size), int64_t(patch_size)};
+        std::vector<int64_t> dilations = {1, 1, 1};
+        conv3d(conv_output,
+               pixel_values_buf,
+               weight->w_v_patch_embed_proj[0],
+               weight->b_v_patch_embed_proj[0],
+               pads, strides, dilations);
+        visual_embeds = conv_output->view({num_patches, vision_hidden_size});
+    }
+
+    // printf("here3\n");
+    // 构建 logits_in：文本token查表，视觉token用visual_embeds顺序替代
+    size_t vis_idx = 0;
+    for (uint32_t i = 0; i < ntok; i++) {
+        const bool is_vision_tok = (tokens[i] >= 151652 && tokens[i] <= 151656);
+        if (has_vision && is_vision_tok && visual_embeds) {
+            RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),
+                                           visual_embeds->data(vis_idx * d),
+                                           dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
+            vis_idx++;
+        } else {
+            RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),
+                                           weight->w_in_embd->data(tokens[i] * d),
+                                           dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
+        }
+    }
+
+    // printf("here4\n");
+
     // Attention
     // attention inner
     size_t max_qk_size = 0;
@@ -196,6 +183,8 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
     auto attn_val_buf = Tensor::buffer(dt_logits, {nkvh, ngroup * max_seq_len, dh}, rsrc.memory_pool);
     auto attn_val_gemm = attn_val_buf->view({nkvh, ngroup, max_seq_len, dh});
 
+    // printf("here5\n");
+
     // Compute
     for (uint32_t layer = 0; layer < nlayer; layer++) {
         // 1. Attention
@@ -211,9 +200,14 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
         linear(v_buf, logits_out,
                weight->w_attn_v[layer],
                1.0, 0.0, nullptr, has_qkv_bias ? weight->b_attn_v[layer] : nullptr);
-        // mrope_2d
-        mrope_2d(q_buf->view({nh, ntok, dh}), q_buf->view({nh, ntok, dh}), pos_ids_buf, weight->sin_table, weight->cos_table);
-        mrope_2d(k_buf->view({nkvh, ntok, dh}), k_buf->view({nkvh, ntok, dh}), pos_ids_buf, weight->sin_table, weight->cos_table);
+        // mrope_2d（无pos_ids时跳过以避免崩溃）
+        if (pos_ids_buf) {
+            mrope_2d(q_buf->view({nh, ntok, dh}), q_buf->view({nh, ntok, dh}), pos_ids_buf, weight->sin_table, weight->cos_table);
+            mrope_2d(k_buf->view({nkvh, ntok, dh}), k_buf->view({nkvh, ntok, dh}), pos_ids_buf, weight->sin_table, weight->cos_table);
+        }
+
+        // printf("here5.1\n");
+
         size_t token_offset = 0;
         for (uint32_t req = 0; req < nreq; req++) {
             auto past_len = req_pos[req];
@@ -243,6 +237,9 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
 
             token_offset += seq_len;
         }
+
+        // printf("here5.2\n");
+
         // o_proj
         linear(logits_in, o_buf, weight->w_attn_out[layer],
                1.0, 0.0, idev == 0 ? logits_in : nullptr, nullptr); // only rank 0 adds residual
@@ -253,6 +250,9 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
                 INFINICCL_SUM, rsrc.comm, stream));
             RUN_INFINI(infinirtStreamSynchronize(stream));
         }
+
+        // printf("here5.3\n");
+
         // 2. FFN
         rmsnorm(logits_out, logits_in, weight->w_ffn_norm[layer], meta->epsilon);
         linear(gate_buf, logits_out,
@@ -273,6 +273,9 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
             RUN_INFINI(infinirtStreamSynchronize(stream));
         }
     }
+
+    // printf("here6\n");
+
     // Sample and Output
     if (idev == 0) {
         if (last_logits != nullptr) {
@@ -312,6 +315,8 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
             }
         }
     }
+
+    // printf("here7\n");
 }
 
 __C void
@@ -319,6 +324,7 @@ inferBatchQwen3VL(struct Qwen3VLModel *model,
                   const uint32_t *tokens, uint32_t ntok,
                   const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
                   const uint32_t *pos_ids, uint32_t pos_ids_len,
+                  const float *pixel_values,
                   struct KVCache **kv_caches,
                   const float *temperature, const uint32_t *topk, const float *topp,
                   uint32_t *output) {
@@ -329,6 +335,7 @@ inferBatchQwen3VL(struct Qwen3VLModel *model,
     model->req.req_pos = req_pos;
     model->req.pos_ids = pos_ids;
     model->req.pos_ids_len = pos_ids_len;
+    model->req.pixel_values = pixel_values;
     model->req.kv_caches = kv_caches;
     model->req.output = output;
     model->req.logits = nullptr;
@@ -355,6 +362,7 @@ forwardBatchQwen3VL(struct Qwen3VLModel *model,
                     const uint32_t *tokens, uint32_t ntok,
                     const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
                     const uint32_t *pos_ids, uint32_t pos_ids_len,
+                    const float *pixel_values,
                     struct KVCache **kv_caches,
                     void *logits) {
     model->req.tokens = tokens;
@@ -364,6 +372,7 @@ forwardBatchQwen3VL(struct Qwen3VLModel *model,
     model->req.req_pos = req_pos;
     model->req.pos_ids = pos_ids;
     model->req.pos_ids_len = pos_ids_len;
+    model->req.pixel_values = pixel_values;
     model->req.kv_caches = kv_caches;
     model->req.output = nullptr;
     model->req.logits = logits;
@@ -414,7 +423,7 @@ void launchDevice(const Qwen3VLMeta *meta, std::shared_ptr<Qwen3VLDeviceWeight> 
 
         inferDeviceBatch(meta, *rsrc, idev, ndev, req.tokens, req.ntok,
                          req.req_lens, req.nreq, req.req_pos, req.pos_ids, req.pos_ids_len,
-                         nullptr, 0, // TODO: 添加 pixel_values 和 is_vision_mode
+                         req.pixel_values, 0,
                          req.kv_caches, req.temperature, req.topk, req.topp, req.output, req.logits);
 
         state.proceed = false;

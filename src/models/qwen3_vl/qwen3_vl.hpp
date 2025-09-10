@@ -74,6 +74,7 @@ struct InferRequest {
     const uint32_t *req_pos;
     const uint32_t *pos_ids;
     uint32_t pos_ids_len;
+    const float *pixel_values;
     struct KVCache **kv_caches;
     const float *temperature;
     const uint32_t *topk;
