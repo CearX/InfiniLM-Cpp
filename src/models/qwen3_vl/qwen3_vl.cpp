@@ -110,14 +110,14 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
 
     // printf("here2\n");
 
-    std::shared_ptr<Tensor> visual_embeds; // [num_patches, d]
+    std::shared_ptr<Tensor> visual_embeds; // [num_patches, vision_hidden_size]
     const bool has_vision = (pixel_values != nullptr) && (num_patches > 0);
     if (has_vision) {
         // 根据权重形状确定实际参数: [vision_hidden_size, 3, temporal, patch, patch]
         uint32_t in_channels = 3;
         uint32_t temporal_patch_size = 2;
         uint32_t patch_size = 16;
-        uint32_t vision_hidden_size = d; // 直接对齐到文本hidden size，便于拼接
+        uint32_t vision_hidden_size = static_cast<uint32_t>(meta->vision_hidden_size);
         uint32_t patch_feature_dim = in_channels * temporal_patch_size * patch_size * patch_size;
 
         // 输入像素: [num_patches, 3, 2, 16, 16]
@@ -148,12 +148,25 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
     // 构建 logits_in：文本token查表，视觉token用visual_embeds顺序替代
     size_t vis_idx = 0;
     for (uint32_t i = 0; i < ntok; i++) {
-        const bool is_vision_tok = (tokens[i] >= 151652 && tokens[i] <= 151656);
-        if (has_vision && is_vision_tok && visual_embeds) {
-            RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),
-                                           visual_embeds->data(vis_idx * d),
-                                           dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
-            vis_idx++;
+        const bool is_image_tok = (meta->image_token_id != 0 && tokens[i] == meta->image_token_id);
+        const bool is_video_tok = (meta->video_token_id != 0 && tokens[i] == meta->video_token_id);
+        if (has_vision && (is_image_tok || is_video_tok) && visual_embeds) {
+            if (vis_idx < num_patches) {
+                // 若视觉hidden与文本hidden不同，按较小维度拷贝
+                uint32_t copy_dim = std::min<uint32_t>(d, static_cast<uint32_t>(visual_embeds->shape()[1]));
+                if (copy_dim > 0) {
+                    RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),
+                                                   visual_embeds->data(vis_idx * visual_embeds->shape()[1]),
+                                                   dsize(dt_logits) * copy_dim, INFINIRT_MEMCPY_D2D, stream));
+                }
+                // 如需补零，这里暂不填充，其余维度保留为初始值（后续算子会覆盖）。
+                vis_idx++;
+            } else {
+                // 安全保护：视觉patch不足，回退到文本嵌入
+                RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),
+                                               weight->w_in_embd->data(tokens[i] * d),
+                                               dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
+            }
         } else {
             RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),
                                            weight->w_in_embd->data(tokens[i] * d),
@@ -185,7 +198,7 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
 
     // printf("here5\n");
 
-    // Compute
+    // Compute vit
     for (uint32_t layer = 0; layer < nlayer; layer++) {
         // 1. Attention
         // rms norm
@@ -201,6 +214,99 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
                weight->w_attn_v[layer],
                1.0, 0.0, nullptr, has_qkv_bias ? weight->b_attn_v[layer] : nullptr);
         // mrope_2d（无pos_ids时跳过以避免崩溃）
+        if (pos_ids_buf) {
+            mrope_2d(q_buf->view({nh, ntok, dh}), q_buf->view({nh, ntok, dh}), pos_ids_buf, weight->sin_table, weight->cos_table);
+            mrope_2d(k_buf->view({nkvh, ntok, dh}), k_buf->view({nkvh, ntok, dh}), pos_ids_buf, weight->sin_table, weight->cos_table);
+        }
+
+        // printf("here5.1\n");
+
+        size_t token_offset = 0;
+        for (uint32_t req = 0; req < nreq; req++) {
+            auto past_len = req_pos[req];
+            auto seq_len = req_lens[req];
+            auto total_len = past_len + seq_len;
+            auto o = o_buf->slice({{0, token_offset, seq_len}})->view({seq_len, nkvh, ngroup, dh})->permute({1, 2, 0, 3});
+            auto q = q_buf->slice({{0, token_offset, seq_len}})->view({seq_len, nkvh, ngroup, dh})->permute({1, 2, 0, 3});
+            auto k = k_buf->slice({{0, token_offset, seq_len}})->view({seq_len, nkvh, dh});
+            auto v = v_buf->slice({{0, token_offset, seq_len}})->view({seq_len, nkvh, dh});
+
+            // self attention
+            // concat
+            rearrange(kv_caches[req]->k[idev][layer]->slice(0, past_len, seq_len), k);
+            rearrange(kv_caches[req]->v[idev][layer]->slice(0, past_len, seq_len), v);
+            // qk
+            rearrange(q_rearrange->slice(2, 0, seq_len), q);
+            auto qk_gemm = qk_buf->slice(0, 0, nh * seq_len * total_len)->view({nkvh, ngroup * seq_len, total_len});
+            auto k_gemm = kv_caches[req]->k[idev][layer]->slice(0, 0, total_len)->permute({1, 2, 0});
+            linear(qk_gemm, rearrange_q_buf->slice(1, 0, ngroup * seq_len), k_gemm, 1.f / float(sqrt(dh)), 0.f, nullptr, nullptr);
+            // softmax
+            auto qk_softmax = qk_gemm->view({nh, seq_len, total_len});
+            causalSoftmax(qk_softmax, qk_softmax);
+            auto v_gemm = kv_caches[req]->v[idev][layer]->slice(0, 0, total_len)->permute({1, 0, 2});
+            linear(attn_val_buf->slice(1, 0, ngroup * seq_len), qk_gemm, v_gemm, 1.f, 0.f, nullptr, nullptr);
+            // rearrange attn val
+            rearrange(o, attn_val_gemm->slice(2, 0, seq_len));
+
+            token_offset += seq_len;
+        }
+
+        // printf("here5.2\n");
+
+        // o_proj
+        linear(logits_in, o_buf, weight->w_attn_out[layer],
+               1.0, 0.0, idev == 0 ? logits_in : nullptr, nullptr); // only rank 0 adds residual
+        // All_reduce if distributed
+        if (rsrc.comm != nullptr) {
+            RUN_INFINI(infinicclAllReduce(
+                logits_in->data(), logits_in->data(), ntok * d, dt_logits,
+                INFINICCL_SUM, rsrc.comm, stream));
+            RUN_INFINI(infinirtStreamSynchronize(stream));
+        }
+
+        // printf("here5.3\n");
+
+        // 2. FFN
+        rmsnorm(logits_out, logits_in, weight->w_ffn_norm[layer], meta->epsilon);
+        linear(gate_buf, logits_out,
+               weight->w_ffn_gate[layer],
+               1.0, 0.0, nullptr, nullptr);
+        linear(up_buf, logits_out,
+               weight->w_ffn_up[layer],
+               1.0, 0.0, nullptr, nullptr);
+        swiglu(gate_buf, up_buf, gate_buf);
+        linear(logits_in, gate_buf,
+               weight->w_ffn_down[layer],
+               1.0, 0.0, idev == 0 ? logits_in : nullptr, nullptr); // only rank 0 adds residual
+        // All_reduce if distributed
+        if (rsrc.comm != nullptr) {
+            RUN_INFINI(infinicclAllReduce(
+                logits_in->data(), logits_in->data(), ntok * d, dt_logits,
+                INFINICCL_SUM, rsrc.comm, stream));
+            RUN_INFINI(infinirtStreamSynchronize(stream));
+        }
+    }
+
+    // todo merger & deepstack
+
+    // todo concat img_embd & text_embd
+
+    // Compute llm
+    for (uint32_t layer = 0; layer < nlayer; layer++) {
+        // 1. Attention
+        // rms norm
+        rmsnorm(logits_out, logits_in, weight->w_attn_norm[layer], meta->epsilon);
+        // qkv_proj
+        linear(q_buf, logits_out,
+               weight->w_attn_q[layer],
+               1.0, 0.0, nullptr, has_qkv_bias ? weight->b_attn_q[layer] : nullptr);
+        linear(k_buf, logits_out,
+               weight->w_attn_k[layer],
+               1.0, 0.0, nullptr, has_qkv_bias ? weight->b_attn_k[layer] : nullptr);
+        linear(v_buf, logits_out,
+               weight->w_attn_v[layer],
+               1.0, 0.0, nullptr, has_qkv_bias ? weight->b_attn_v[layer] : nullptr);
+        // todo 3d mrope
         if (pos_ids_buf) {
             mrope_2d(q_buf->view({nh, ntok, dh}), q_buf->view({nh, ntok, dh}), pos_ids_buf, weight->sin_table, weight->cos_table);
             mrope_2d(k_buf->view({nkvh, ntok, dh}), k_buf->view({nkvh, ntok, dh}), pos_ids_buf, weight->sin_table, weight->cos_table);

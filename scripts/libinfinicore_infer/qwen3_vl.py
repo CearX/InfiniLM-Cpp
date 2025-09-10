@@ -36,6 +36,9 @@ class Qwen3VLMetaCStruct(Structure):
         ("vision_heads", c_size_t),
         ("patch_size", c_size_t),
         ("img_size", c_size_t),
+        # token ids
+        ("image_token_id", c_uint),
+        ("video_token_id", c_uint),
     ]
 
 

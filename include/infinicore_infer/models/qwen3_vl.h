@@ -27,6 +27,9 @@ typedef struct
     size_t vision_heads;
     size_t patch_size;
     size_t img_size;
+    // Token ids
+    uint32_t image_token_id;
+    uint32_t video_token_id;
 } Qwen3VLMeta;
 
 //////////////////// APIs ///////////////////////

@@ -207,12 +207,23 @@ class Qwen3VLMetaFromConfig(Qwen3VLMetaCStruct):
             vision_heads=vision_config.get("num_heads", 12),
             patch_size=vision_config.get("patch_size", 16),
             img_size=vision_config.get("img_size", 768),
+            image_token_id=int(config.get("image_token_id", 151654)),
+            video_token_id=int(config.get("video_token_id", 151656)),
         )
         self.torch_dtype_logits = dtype
+        # 保留到python对象上，供上层使用
+        try:
+            self.image_token_id = int(config.get("image_token_id", 151654))
+        except Exception:
+            self.image_token_id = 151654
+        try:
+            self.video_token_id = int(config.get("video_token_id", 151656))
+        except Exception:
+            self.video_token_id = 151656
 
 
 class Qwen3VLBatchedTask:
-    def __init__(self, tasks: List[InferTask], image_path: str | None = None, config: dict | None = None):
+    def __init__(self, tasks: List[InferTask], image_path: str | None = None, video_path: str | None = None, config: dict | None = None):
         self.tasks = tasks
         self.nreq = len(tasks)
 
@@ -234,6 +245,7 @@ class Qwen3VLBatchedTask:
         self.patch_dim = 0
         self.grid_thw = None
         self.image_path = image_path
+        self.video_path = video_path
         # 从config中读取image/video token id（若存在）
         self.image_token_id = None
         self.video_token_id = None
@@ -249,16 +261,25 @@ class Qwen3VLBatchedTask:
                 except Exception:
                     pass
             return 151652 <= tid <= 151656
+        def is_video_tok(tid: int) -> bool:
+            if self.video_token_id is not None:
+                try:
+                    return tid == int(self.video_token_id)
+                except Exception:
+                    pass
+            return tid == 151656
 
         for task in tasks:
-            if task.pos == 0 and any(is_image_tok(token) for token in task.tokens):
+            if task.pos == 0 and any(is_image_tok(token) or is_video_tok(token) for token in task.tokens):
                 any_prefill_with_image = True
                 break
         if any_prefill_with_image:
             try:
-                if self.image_path is None:
-                    raise RuntimeError("image_path is None for prefill with vision input")
-                self.pixel_values, self.grid_thw = preprocess_image_qwen3vl(self.image_path)
+                # 优先使用image_path，否则尝试video_path（暂复用图像预处理以打通管道）
+                src_path = self.image_path if self.image_path is not None else self.video_path
+                if src_path is None:
+                    raise RuntimeError("no image/video path provided for prefill with vision input")
+                self.pixel_values, self.grid_thw = preprocess_image_qwen3vl(src_path)
                 self.patch_dim = self.pixel_values.shape[1]
             except Exception as _e:
                 self.pixel_values = None
@@ -418,9 +439,9 @@ class Qwen3VLForCausalLM:
     def drop_kv_cache(self, kv_cache):
         self.qwen3vl_model.drop_kv_cache(kv_cache)
 
-    def batch_infer_one_round(self, tasks: List[InferTask], image_path: str | None = None):
+    def batch_infer_one_round(self, tasks: List[InferTask], image_path: str | None = None, video_path: str | None = None):
         output = (c_uint * len(tasks))()
-        batch_inputs = Qwen3VLBatchedTask(tasks, image_path=image_path, config=self.config)
+        batch_inputs = Qwen3VLBatchedTask(tasks, image_path=image_path, video_path=video_path, config=self.config)
         self.qwen3vl_model.infer_batch(
             self.model_instance,
             *(batch_inputs.input_args()),
@@ -448,7 +469,7 @@ class Qwen3VLForCausalLM:
         print(f"LLM 模块推理: {len(text_tokens)} tokens")
         return None  # 占位符
 
-    def generate(self, input_content, max_steps, topp_=1.0, topk_=1, temperature_=1.0, image_path=None):
+    def generate(self, input_content, max_steps, topp_=1.0, topk_=1, temperature_=1.0, image_path=None, video_path=None):
         input_content = self.tokenizer.apply_chat_template(
             conversation=[{"role": "user", "content": input_content}],
             add_generation_prompt=True,
@@ -473,8 +494,12 @@ class Qwen3VLForCausalLM:
 
         for step_i in range(max_steps):
             start_time = time.time()
-            # prefill: step 0，传入image_path；decode：后续步不传
-            output_tokens = self.batch_infer_one_round([infer_task], image_path=image_path if step_i == 0 else None)
+            # prefill: step 0，传入image/video；decode：后续步不传
+            output_tokens = self.batch_infer_one_round(
+                [infer_task],
+                image_path=image_path if step_i == 0 else None,
+                video_path=video_path if step_i == 0 else None,
+            )
             end_time = time.time()
             steps += 1
             # output_str = (
