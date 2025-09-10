@@ -1,6 +1,7 @@
 #include "inference_context.hpp"
 #include "../tensor.hpp"
 #include "../utils.hpp"
+#include "infiniop/ops/conv.h"
 
 InferenceContext::InferenceContext(infiniopHandle_t op_handle_, std::shared_ptr<MemoryPool> memory_pool_, CacheManager *cache_manager, infinirtStream_t stream)
     : op_handle(op_handle_), memory_pool(memory_pool_), cache_manager(cache_manager), stream(stream) {}
@@ -358,4 +359,36 @@ void InferenceContext::dequant(std::shared_ptr<Tensor> weight,
     RUN_INFINI(infiniopDequantize(
         desc, workspace, workspace_size,
         weight->data(), in_w->data(), in_s->data(), in_z->data(), 0, 0, 0, stream));
+}
+
+void InferenceContext::conv3d(std::shared_ptr<Tensor> output,
+                              std::shared_ptr<Tensor> input,
+                              std::shared_ptr<Tensor> weight,
+                              std::shared_ptr<Tensor> bias,
+                              const std::vector<int64_t> &pads,
+                              const std::vector<int64_t> &strides,
+                              const std::vector<int64_t> &dilations) {
+    size_t key = CacheManager::createDescriptorKey(output, input, weight, bias);
+
+    infiniopConvDescriptor_t desc;
+    if (!cache_manager->getConvDescriptor(key, desc)) {
+        RUN_INFINI(infiniopCreateConvDescriptor(
+            op_handle, &desc,
+            output->desc(), input->desc(), weight->desc(), bias->desc(),
+            const_cast<int64_t *>(pads.data()),
+            const_cast<int64_t *>(strides.data()),
+            const_cast<int64_t *>(dilations.data()),
+            pads.size()));
+        cache_manager->putConvDescriptor(key, desc);
+    }
+
+    size_t workspace_size = 0;
+    RUN_INFINI(infiniopGetConvWorkspaceSize(desc, &workspace_size));
+    ensure_workspace(workspace_size);
+    void *workspace = workspace_storage->memory();
+
+    RUN_INFINI(infiniopConv(
+        desc, workspace, workspace_size,
+        output->data(), input->data(), weight->data(),
+        bias ? bias->data() : nullptr, stream));
 }

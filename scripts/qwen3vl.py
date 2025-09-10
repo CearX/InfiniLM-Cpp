@@ -230,15 +230,20 @@ class Qwen3VLBatchedTask:
 
         # 对于 ViT：如果有图像输入，ntok 应该是 patch 数量而不是 token 数量
         if any(any(token >= 151652 and token <= 151656 for token in task.tokens) for task in tasks):
-            # 计算图像的 patch 数量
+            # 计算图像的 patch 数量，同时保存 pixel_values 供后续使用
             try:
                 image_path = "/home/cearx/qy/model/Qwen3-VL-2B-Vit-86M-0828/image3.jpg"
-                pixel_values, grid_thw = preprocess_image_qwen3vl(image_path)
-                self.ntok = pixel_values.shape[0]  # patch 数量
+                self.pixel_values, grid_thw = preprocess_image_qwen3vl(image_path)
+                self.ntok = self.pixel_values.shape[0]  # patch 数量
+                self.patch_dim = self.pixel_values.shape[1]  # patch 特征维度
             except:
                 self.ntok = len(flat_tokens)  # 回退到 token 数量
+                self.pixel_values = None
+                self.patch_dim = 0
         else:
             self.ntok = len(flat_tokens)
+            self.pixel_values = None
+            self.patch_dim = 0
 
         # 实现 2D MRoPE pos_ids 计算
         # 集成图像 pos_ids 到批处理中
@@ -320,6 +325,13 @@ class Qwen3VLBatchedTask:
 
 
 class Qwen3VLForCausalLM:
+    """
+    双模块架构：ViT 模块 + LLM 模块
+
+    工作流程：
+    1. Image → Python 预处理 → ViT 模块(C++) → visual_embeddings
+    2. Text + visual_embeddings → LLM 模块(C++) → output
+    """
     def __init__(self, model_dir_path, device=DeviceType.DEVICE_TYPE_CPU, ndev=1, max_tokens=None):
         load_start_time = time.time()
         print(f"Creating model on {ndev} devices...")
@@ -413,7 +425,27 @@ class Qwen3VLForCausalLM:
         )
         return list(output)
 
-    def generate(self, input_content, max_steps, topp_=1.0, topk_=1, temperature_=1.0):
+    def infer_vision_module(self, image_path):
+        """
+        ViT 模块推理：Image → visual_embeddings
+        """
+        # Python 图像预处理
+        pixel_values, grid_thw = preprocess_image_qwen3vl(image_path)
+        pos_ids = compute_2d_mrope_pos_ids(grid_thw)
+
+        # TODO: C++ ViT 推理 (is_vision_mode=True)
+        print(f"ViT 模块推理: {pixel_values.shape} patches")
+        return None  # 占位符
+
+    def infer_llm_module(self, text_tokens, visual_embeddings=None):
+        """
+        LLM 模块推理：Text + visual_embeddings → output
+        """
+        # TODO: C++ LLM 推理 (is_vision_mode=False，自动token替换)
+        print(f"LLM 模块推理: {len(text_tokens)} tokens")
+        return None  # 占位符
+
+    def generate(self, input_content, max_steps, topp_=1.0, topk_=1, temperature_=1.0, image_path=None):
         input_content = self.tokenizer.apply_chat_template(
             conversation=[{"role": "user", "content": input_content}],
             add_generation_prompt=True,

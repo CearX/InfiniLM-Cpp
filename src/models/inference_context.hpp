@@ -67,6 +67,13 @@ struct InferenceContext {
                       std::shared_ptr<Tensor> prob,
                       float random_val, float top_p, uint32_t top_k, float temperature);
 
+    void conv3d(std::shared_ptr<Tensor> output,
+                std::shared_ptr<Tensor> input,
+                std::shared_ptr<Tensor> weight,
+                std::shared_ptr<Tensor> bias,
+                const std::vector<int64_t> &pads,
+                const std::vector<int64_t> &strides,
+                const std::vector<int64_t> &dilations);
     void linear(std::shared_ptr<Tensor> c,
                 std::shared_ptr<Tensor> a,
                 std::shared_ptr<Tensor> b,
@@ -161,6 +168,16 @@ inline void swiglu(std::shared_ptr<Tensor> out, std::shared_ptr<Tensor> up,
 inline void randomSample(std::shared_ptr<Tensor> out, std::shared_ptr<Tensor> prob,
                          float random_val, float top_p, uint32_t top_k, float temperature) {
     getInferenceContext().randomSample(out, prob, random_val, top_p, top_k, temperature);
+}
+
+inline void conv3d(std::shared_ptr<Tensor> output,
+                   std::shared_ptr<Tensor> input,
+                   std::shared_ptr<Tensor> weight,
+                   std::shared_ptr<Tensor> bias,
+                   const std::vector<int64_t> &pads,
+                   const std::vector<int64_t> &strides,
+                   const std::vector<int64_t> &dilations) {
+    getInferenceContext().conv3d(output, input, weight, bias, pads, strides, dilations);
 }
 
 inline void linear(std::shared_ptr<Tensor> c, std::shared_ptr<Tensor> a,

@@ -50,6 +50,7 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
                       const uint32_t *tokens, uint32_t ntok,
                       const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
                       const uint32_t *pos_ids, uint32_t pos_ids_len,
+                      const float *pixel_values, uint32_t is_vision_mode, // 新增：视觉数据和模式标志
                       struct KVCache **kv_caches,
                       const float *temperature, const uint32_t *topk, const float *topp,
                       uint32_t *output, void *last_logits) {
@@ -102,10 +103,78 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
         RUN_INFINI(infinirtMemcpyAsync(pos_ids_buf->data(), pos_ids, sizeof(uint32_t) * pos_ids_len,
                                        INFINIRT_MEMCPY_H2D, stream));
     }
-    for (uint32_t i = 0; i < ntok; i++) {
-        RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),
-                                       weight->w_in_embd->data(tokens[i] * d),
-                                       dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
+    // 双模块架构：ViT 模块 vs LLM 模块
+    if (is_vision_mode) {
+        // === ViT 模块 ===
+        // Patch Embedding: pixel_values [ntok, patch_feature_dim] -> [ntok, hidden_size]
+        if (pixel_values != nullptr) {
+            // 🚀 实现真正的 3D Conv Patch Embedding (InfiniCore)
+            // 根据配置: patch_size=16, temporal_patch_size=2, in_channels=3, hidden_size=768
+            // vLLM: Conv3d(3, 768, kernel=(2,16,16), stride=(2,16,16))
+
+            // 从权重形状确定实际参数: [768, 3, 2, 16, 16]
+            uint32_t in_channels = 3;
+            uint32_t temporal_patch_size = 2;
+            uint32_t patch_size = 16;          // 根据权重注释确认
+            uint32_t vision_hidden_size = 768; // ViT hidden_size
+            uint32_t patch_feature_dim = in_channels * temporal_patch_size * patch_size * patch_size;
+
+            // 创建输入张量: [ntok, patch_feature_dim] -> view -> [ntok, 3, 2, 16, 16]
+            std::shared_ptr<Tensor> pixel_values_buf;
+            if (rsrc.device == INFINI_DEVICE_CPU) {
+                pixel_values_buf = Tensor::weight(const_cast<float *>(pixel_values), dt_logits,
+                                                  {ntok, in_channels, temporal_patch_size, patch_size, patch_size});
+            } else {
+                pixel_values_buf = Tensor::buffer(dt_logits, {ntok, in_channels, temporal_patch_size, patch_size, patch_size}, rsrc.memory_pool);
+                RUN_INFINI(infinirtMemcpyAsync(pixel_values_buf->data(), pixel_values,
+                                               sizeof(float) * ntok * patch_feature_dim,
+                                               INFINIRT_MEMCPY_H2D, stream));
+            }
+
+            // 创建输出张量: [ntok, vision_hidden_size, 1, 1, 1] -> flatten -> [ntok, vision_hidden_size]
+            auto conv_output = Tensor::buffer(dt_logits, {ntok, vision_hidden_size, 1, 1, 1}, rsrc.memory_pool);
+
+            // 🚀 调用 InfiniCore Conv3D 算子 (通过 inference_context)
+            // Conv3d: input[ntok,3,2,16,16] * weight[768,3,2,16,16] + bias[768] -> output[ntok,768,1,1,1]
+
+            // 3D 卷积参数: pads=(0,0,0), strides=(2,16,16), dilations=(1,1,1)
+            std::vector<int64_t> pads = {0, 0, 0};
+            std::vector<int64_t> strides = {temporal_patch_size, patch_size, patch_size};
+            std::vector<int64_t> dilations = {1, 1, 1};
+
+            // 执行 3D 卷积 (自动处理缓存和工作空间)
+            conv3d(conv_output,                     // output: [ntok, 768, 1, 1, 1]
+                   pixel_values_buf,                // input:  [ntok, 3, 2, 16, 16]
+                   weight->w_v_patch_embed_proj[0], // weight: [768, 3, 2, 16, 16]
+                   weight->b_v_patch_embed_proj[0], // bias:   [768]
+                   pads, strides, dilations);
+
+            // Reshape输出: [ntok, 768, 1, 1, 1] -> [ntok, 768]
+            auto flattened_output = conv_output->view({ntok, vision_hidden_size});
+            RUN_INFINI(infinirtMemcpyAsync(logits_in->data(), flattened_output->data(),
+                                           sizeof(float) * ntok * vision_hidden_size,
+                                           INFINIRT_MEMCPY_D2D, stream));
+
+            printf("[ViT] 真正的 Conv3D Patch Embedding: [%u, %u, %u, %u, %u] -> [%u, %u]\n",
+                   ntok, in_channels, temporal_patch_size, patch_size, patch_size, ntok, vision_hidden_size);
+        }
+    } else {
+        // === LLM 模块 ===
+        // Text Embedding: token_ids -> embeddings (包括视觉 token 替换)
+        for (uint32_t i = 0; i < ntok; i++) {
+            if (tokens[i] >= 151652 && tokens[i] <= 151656) {
+                // 图像 token：需要替换为预计算的视觉 embedding
+                // TODO: 从 visual_embeddings 中取对应的 embedding
+                RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),
+                                               weight->w_in_embd->data(tokens[i] * d),
+                                               dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
+            } else {
+                // 普通文本 token：直接 embedding lookup
+                RUN_INFINI(infinirtMemcpyAsync(logits_in->data(i * d),
+                                               weight->w_in_embd->data(tokens[i] * d),
+                                               dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
+            }
+        }
     }
     // Attention
     // attention inner
@@ -345,6 +414,7 @@ void launchDevice(const Qwen3VLMeta *meta, std::shared_ptr<Qwen3VLDeviceWeight> 
 
         inferDeviceBatch(meta, *rsrc, idev, ndev, req.tokens, req.ntok,
                          req.req_lens, req.nreq, req.req_pos, req.pos_ids, req.pos_ids_len,
+                         nullptr, 0, // TODO: 添加 pixel_values 和 is_vision_mode
                          req.kv_caches, req.temperature, req.topk, req.topp, req.output, req.logits);
 
         state.proceed = false;
