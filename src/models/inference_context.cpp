@@ -2,6 +2,8 @@
 #include "../tensor.hpp"
 #include "../utils.hpp"
 #include "infiniop/ops/conv.h"
+#include "infiniop/ops/gelu.h"
+#include "infiniop/ops/layer_norm.h"
 
 InferenceContext::InferenceContext(infiniopHandle_t op_handle_, std::shared_ptr<MemoryPool> memory_pool_, CacheManager *cache_manager, infinirtStream_t stream)
     : op_handle(op_handle_), memory_pool(memory_pool_), cache_manager(cache_manager), stream(stream) {}
@@ -55,6 +57,30 @@ void InferenceContext::rmsnorm(std::shared_ptr<Tensor> y,
     RUN_INFINI(infiniopRMSNorm(
         desc, workspace, workspace_size,
         y->data(), x->data(), w->data(), stream));
+}
+
+void InferenceContext::layernorm(std::shared_ptr<Tensor> y,
+                                 std::shared_ptr<Tensor> x,
+                                 std::shared_ptr<Tensor> w,
+                                 std::shared_ptr<Tensor> b,
+                                 float epsilon) {
+    size_t key = CacheManager::createDescriptorKey(y, x, w, b);
+
+    infiniopLayerNormDescriptor_t desc;
+    if (!cache_manager->getLayerNormDescriptor(key, desc)) {
+        RUN_INFINI(infiniopCreateLayerNormDescriptor(
+            op_handle, &desc, y->desc(), nullptr, nullptr, x->desc(), w->desc(), b ? b->desc() : nullptr, epsilon));
+        cache_manager->putLayerNormDescriptor(key, desc);
+    }
+
+    size_t workspace_size = 0;
+    RUN_INFINI(infiniopGetLayerNormWorkspaceSize(desc, &workspace_size));
+    ensure_workspace(workspace_size);
+    void *workspace = workspace_storage->memory();
+
+    RUN_INFINI(infiniopLayerNorm(
+        desc, workspace, workspace_size,
+        y->data(), nullptr, nullptr, x->data(), w->data(), b ? b->data() : nullptr, stream));
 }
 
 void InferenceContext::gemm(std::shared_ptr<Tensor> c,
@@ -391,4 +417,22 @@ void InferenceContext::conv3d(std::shared_ptr<Tensor> output,
         desc, workspace, workspace_size,
         output->data(), input->data(), weight->data(),
         bias ? bias->data() : nullptr, stream));
+}
+
+void InferenceContext::gelu(std::shared_ptr<Tensor> output,
+                            std::shared_ptr<Tensor> input) {
+    size_t key = CacheManager::createDescriptorKey(output, input);
+
+    infiniopGeluDescriptor_t desc;
+    if (!cache_manager->getGeluDescriptor(key, desc)) {
+        RUN_INFINI(infiniopCreateGeluDescriptor(op_handle, &desc, output->desc(), input->desc()));
+        cache_manager->putGeluDescriptor(key, desc);
+    }
+
+    size_t workspace_size = 0;
+    RUN_INFINI(infiniopGetGeluWorkspaceSize(desc, &workspace_size));
+    ensure_workspace(workspace_size);
+    void *workspace = workspace_storage->memory();
+
+    RUN_INFINI(infiniopGelu(desc, workspace, workspace_size, output->data(), input->data(), stream));
 }

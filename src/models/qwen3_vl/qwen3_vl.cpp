@@ -141,7 +141,77 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
                weight->w_v_patch_embed_proj[0],
                weight->b_v_patch_embed_proj[0],
                pads, strides, dilations);
-        visual_embeds = conv_output->view({num_patches, vision_hidden_size});
+        // ==== ViT正确流程：patch_embed -> vit_blocks -> merger ====
+        auto vit_hidden = conv_output->view({num_patches, vision_hidden_size});
+
+        // TODO: 实现完整的ViT blocks（attention + ffn循环）
+        // 当前简化：直接使用patch_embed输出作为blocks输出
+
+        // ==== Merger：spatial重排 + LayerNorm + MLP ====
+        const uint32_t spatial_merge_size = 2;
+        const uint32_t merge_unit = spatial_merge_size * spatial_merge_size; // 4
+
+        // Deepstack特征存储（多尺度）
+        std::vector<std::shared_ptr<Tensor>> deepstack_features;
+
+        if (num_patches >= merge_unit && weight->w_v_merger_mlp_0.size() > 0 && weight->w_v_merger_mlp_2.size() > 0) {
+            uint32_t num_groups = num_patches / merge_unit;
+            uint32_t hidden_size_merged = vision_hidden_size * merge_unit;
+
+            // 空间重排：已在Python端按grid完成，这里按顺序取4个patch拼接
+            auto merger_in = Tensor::buffer(dt_logits, {num_groups, hidden_size_merged}, rsrc.memory_pool);
+            for (uint32_t g = 0; g < num_groups; ++g) {
+                for (uint32_t k = 0; k < merge_unit; ++k) {
+                    RUN_INFINI(infinirtMemcpyAsync(
+                        merger_in->data(g * hidden_size_merged + k * vision_hidden_size),
+                        vit_hidden->data((g * merge_unit + k) * vision_hidden_size),
+                        dsize(dt_logits) * vision_hidden_size, INFINIRT_MEMCPY_D2D, stream));
+                }
+            }
+
+            // LayerNorm
+            auto merger_norm = Tensor::buffer(dt_logits, {num_groups, hidden_size_merged}, rsrc.memory_pool);
+            layernorm(merger_norm, merger_in, weight->w_v_merger_ln_q[0], weight->b_v_merger_ln_q[0], meta->epsilon);
+
+            // MLP: fc1 -> GELU -> fc2
+            auto merger_fc1 = Tensor::buffer(dt_logits, {num_groups, hidden_size_merged}, rsrc.memory_pool);
+            linear(merger_fc1, merger_norm, weight->w_v_merger_mlp_0[0], 1.0, 0.0, nullptr, nullptr);
+
+            auto merger_gelu = Tensor::buffer(dt_logits, {num_groups, hidden_size_merged}, rsrc.memory_pool);
+            getInferenceContext().gelu(merger_gelu, merger_fc1);
+
+            auto merger_out = Tensor::buffer(dt_logits, {num_groups, d}, rsrc.memory_pool);
+            linear(merger_out, merger_gelu, weight->w_v_merger_mlp_2[0], 1.0, 0.0, nullptr, nullptr);
+
+            visual_embeds = merger_out;
+            num_patches = num_groups;
+
+            // ==== Deepstack：生成多尺度特征 ====
+            // TODO: 根据deepstack_visual_indexes生成不同层级的特征
+            // 当前简化：复制主特征作为deepstack占位
+            if (weight->w_v_merger_list_0_mlp_0.size() > 0) {
+                auto deepstack_0 = Tensor::buffer(dt_logits, {num_groups, d}, rsrc.memory_pool);
+                RUN_INFINI(infinirtMemcpyAsync(deepstack_0->data(), visual_embeds->data(),
+                                               dsize(dt_logits) * num_groups * d, INFINIRT_MEMCPY_D2D, stream));
+                deepstack_features.push_back(deepstack_0);
+            }
+        } else {
+            // 兜底：简单映射到d维
+            if (vision_hidden_size != d) {
+                auto mapped_embeds = Tensor::buffer(dt_logits, {num_patches, d}, rsrc.memory_pool);
+                uint32_t copy_dim = std::min<uint32_t>(d, vision_hidden_size);
+                if (copy_dim > 0) {
+                    RUN_INFINI(infinirtMemcpyAsync(mapped_embeds->data(), vit_hidden->data(),
+                                                   dsize(dt_logits) * num_patches * copy_dim,
+                                                   INFINIRT_MEMCPY_D2D, stream));
+                }
+                visual_embeds = mapped_embeds;
+            } else {
+                visual_embeds = vit_hidden;
+            }
+        }
+
+        RUN_INFINI(infinirtStreamSynchronize(stream));
     }
 
     // printf("here3\n");

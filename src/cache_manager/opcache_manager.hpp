@@ -10,6 +10,8 @@
 #include "../utils.hpp"
 #include "infinicore_infer.h"
 #include "infiniop/ops/conv.h"
+#include "infiniop/ops/gelu.h"
+#include "infiniop/ops/layer_norm.h"
 
 class IDescriptorDestroyer {
 public:
@@ -155,6 +157,7 @@ class CacheManager {
 public:
     DECLARE_OP_CACHE(Add)
     DECLARE_OP_CACHE(RMSNorm)
+    DECLARE_OP_CACHE(LayerNorm)
     DECLARE_OP_CACHE(Gemm)
     DECLARE_OP_CACHE(RoPE)
     DECLARE_OP_CACHE(RoPEv2)
@@ -167,10 +170,12 @@ public:
     DECLARE_OP_CACHE(RandomSample)
     DECLARE_OP_CACHE(Dequantize)
     DECLARE_OP_CACHE(Conv)
+    DECLARE_OP_CACHE(Gelu)
 
     CacheManager(size_t capacity = 100)
         : Add_cache(capacity, DESTROY_FUNC(Add)),
           RMSNorm_cache(capacity, DESTROY_FUNC(RMSNorm)),
+          LayerNorm_cache(capacity, DESTROY_FUNC(LayerNorm)),
           Gemm_cache(capacity, DESTROY_FUNC(Gemm)),
           RoPE_cache(capacity, DESTROY_FUNC(RoPE)),
           RoPEv2_cache(capacity, DESTROY_FUNC(RoPEv2)),
@@ -182,7 +187,8 @@ public:
           SwiGLU_cache(capacity, DESTROY_FUNC(SwiGLU)),
           RandomSample_cache(capacity, DESTROY_FUNC(RandomSample)),
           Dequantize_cache(capacity, DESTROY_FUNC(Dequantize)),
-          Conv_cache(capacity, DESTROY_FUNC(Conv)) {}
+          Conv_cache(capacity, DESTROY_FUNC(Conv)),
+          Gelu_cache(capacity, DESTROY_FUNC(Gelu)) {}
 
     template <typename... Tensors>
     static size_t createDescriptorKey(Tensors... tensors) {
