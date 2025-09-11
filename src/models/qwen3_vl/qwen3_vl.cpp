@@ -158,6 +158,10 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
     // printf("here2\n");
 
     std::shared_ptr<Tensor> visual_embeds; // [num_patches, vision_hidden_size]
+    // Deepstack特征提取层索引（从config读取，默认[3,6,9]）
+    std::vector<uint32_t> deepstack_layers = {3, 6, 9};
+    std::vector<std::shared_ptr<Tensor>> deepstack_features;
+
     const bool has_vision = (pixel_values != nullptr) && (num_patches > 0);
     if (has_vision) {
         // 根据权重形状确定实际参数: [vision_hidden_size, 3, temporal, patch, patch]
@@ -228,6 +232,8 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
         uint32_t vision_heads = static_cast<uint32_t>(meta->vision_heads);
         uint32_t dh_v = vision_heads > 0 ? (vision_hidden_size / vision_heads) : vision_hidden_size;
 
+        // Deepstack特征提取在指定层进行
+
         // 缓冲区
         auto vit_hidden_in = Tensor::buffer(dt_logits, {num_patches, vision_hidden_size}, rsrc.memory_pool);
         auto vit_hidden_out = Tensor::buffer(dt_logits, {num_patches, vision_hidden_size}, rsrc.memory_pool);
@@ -290,6 +296,56 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
             linear(vit_fc2, vit_gelu, weight->w_v_mlp_fc2[vlayer], 1.0, 0.0, nullptr, weight->b_v_mlp_fc2[vlayer]);
             // 残差
             rearrange(vit_hidden_in, vit_fc2->view({num_patches, vision_hidden_size}));
+
+            // 检查是否需要在当前层提取deepstack特征
+            if (std::find(deepstack_layers.begin(), deepstack_layers.end(), vlayer) != deepstack_layers.end()) {
+                // 提取deepstack特征：使用对应的deepstack merger
+                size_t deepstack_idx = std::find(deepstack_layers.begin(), deepstack_layers.end(), vlayer) - deepstack_layers.begin();
+
+                if (deepstack_idx < 3) { // 最多3个deepstack层
+                    const auto &w_ln_q = deepstack_idx == 0 ? weight->w_v_merger_list_0_ln_q
+                                       : deepstack_idx == 1 ? weight->w_v_merger_list_1_ln_q
+                                                            : weight->w_v_merger_list_2_ln_q;
+                    const auto &b_ln_q = deepstack_idx == 0 ? weight->b_v_merger_list_0_ln_q
+                                       : deepstack_idx == 1 ? weight->b_v_merger_list_1_ln_q
+                                                            : weight->b_v_merger_list_2_ln_q;
+                    const auto &w_mlp_0 = deepstack_idx == 0 ? weight->w_v_merger_list_0_mlp_0
+                                        : deepstack_idx == 1 ? weight->w_v_merger_list_1_mlp_0
+                                                             : weight->w_v_merger_list_2_mlp_0;
+                    const auto &b_mlp_0 = deepstack_idx == 0 ? weight->b_v_merger_list_0_mlp_0
+                                        : deepstack_idx == 1 ? weight->b_v_merger_list_1_mlp_0
+                                                             : weight->b_v_merger_list_2_mlp_0;
+                    const auto &w_mlp_2 = deepstack_idx == 0 ? weight->w_v_merger_list_0_mlp_2
+                                        : deepstack_idx == 1 ? weight->w_v_merger_list_1_mlp_2
+                                                             : weight->w_v_merger_list_2_mlp_2;
+                    const auto &b_mlp_2 = deepstack_idx == 0 ? weight->b_v_merger_list_0_mlp_2
+                                        : deepstack_idx == 1 ? weight->b_v_merger_list_1_mlp_2
+                                                             : weight->b_v_merger_list_2_mlp_2;
+
+                    if (w_mlp_0.size() > 0 && num_patches >= 4) {
+                        const uint32_t spatial_merge_size = 2;
+                        const uint32_t merge_unit = spatial_merge_size * spatial_merge_size; // 4
+                        uint32_t num_groups = num_patches / merge_unit;
+                        uint32_t hidden_size_merged = vision_hidden_size * merge_unit;
+
+                        // Deepstack merger处理：reshape然后norm+MLP
+                        auto ds_input = vit_hidden_in->view({num_groups, hidden_size_merged});
+                        auto ds_norm = Tensor::buffer(dt_logits, {num_groups, hidden_size_merged}, rsrc.memory_pool);
+                        layernorm(ds_norm, ds_input, w_ln_q[0], b_ln_q[0], meta->epsilon);
+
+                        auto ds_fc1 = Tensor::buffer(dt_logits, {num_groups, hidden_size_merged}, rsrc.memory_pool);
+                        linear(ds_fc1, ds_norm, w_mlp_0[0], 1.0, 0.0, b_mlp_0[0], nullptr);
+
+                        auto ds_gelu = Tensor::buffer(dt_logits, {num_groups, hidden_size_merged}, rsrc.memory_pool);
+                        getInferenceContext().gelu(ds_gelu, ds_fc1);
+
+                        auto ds_out = Tensor::buffer(dt_logits, {num_groups, d}, rsrc.memory_pool);
+                        linear(ds_out, ds_gelu, w_mlp_2[0], 1.0, 0.0, b_mlp_2[0], nullptr);
+
+                        deepstack_features.push_back(ds_out);
+                    }
+                }
+            }
         }
 
         // ViT 输出设为 visual_embeds，供后续 Merger
@@ -326,9 +382,6 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
         const uint32_t merge_unit = spatial_merge_size * spatial_merge_size; // 4
         const uint32_t vision_hidden_size = static_cast<uint32_t>(meta->vision_hidden_size);
 
-        // Deepstack特征存储
-        std::vector<std::shared_ptr<Tensor>> deepstack_features;
-
         if (num_patches >= merge_unit && weight->w_v_merger_mlp_0.size() > 0) {
             uint32_t num_groups = num_patches / merge_unit;
             uint32_t hidden_size_merged = vision_hidden_size * merge_unit;
@@ -352,46 +405,7 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
             auto merger_out = Tensor::buffer(dt_logits, {num_groups, d}, rsrc.memory_pool);
             linear(merger_out, merger_gelu, weight->w_v_merger_mlp_2[0], 1.0, 0.0, weight->b_v_merger_mlp_2[0], nullptr);
 
-            // Deepstack mergers (use_postshuffle_norm=True): ln_q(x.view(-1, self.hidden_size))
-            for (int ds_idx = 0; ds_idx < 3; ++ds_idx) {
-                const auto &w_ln_q = ds_idx == 0 ? weight->w_v_merger_list_0_ln_q
-                                   : ds_idx == 1 ? weight->w_v_merger_list_1_ln_q
-                                                 : weight->w_v_merger_list_2_ln_q;
-                const auto &b_ln_q = ds_idx == 0 ? weight->b_v_merger_list_0_ln_q
-                                   : ds_idx == 1 ? weight->b_v_merger_list_1_ln_q
-                                                 : weight->b_v_merger_list_2_ln_q;
-                const auto &w_mlp_0 = ds_idx == 0 ? weight->w_v_merger_list_0_mlp_0
-                                    : ds_idx == 1 ? weight->w_v_merger_list_1_mlp_0
-                                                  : weight->w_v_merger_list_2_mlp_0;
-                const auto &b_mlp_0 = ds_idx == 0 ? weight->b_v_merger_list_0_mlp_0
-                                    : ds_idx == 1 ? weight->b_v_merger_list_1_mlp_0
-                                                  : weight->b_v_merger_list_2_mlp_0;
-                const auto &w_mlp_2 = ds_idx == 0 ? weight->w_v_merger_list_0_mlp_2
-                                    : ds_idx == 1 ? weight->w_v_merger_list_1_mlp_2
-                                                  : weight->w_v_merger_list_2_mlp_2;
-                const auto &b_mlp_2 = ds_idx == 0 ? weight->b_v_merger_list_0_mlp_2
-                                    : ds_idx == 1 ? weight->b_v_merger_list_1_mlp_2
-                                                  : weight->b_v_merger_list_2_mlp_2;
-
-                if (w_mlp_0.size() > 0) {
-                    auto ds_input = merger_in->view({num_groups, hidden_size_merged});
-                    auto ds_norm = Tensor::buffer(dt_logits, {num_groups, hidden_size_merged}, rsrc.memory_pool);
-                    layernorm(ds_norm, ds_input, w_ln_q[0], b_ln_q[0], meta->epsilon);
-
-                    auto ds_fc1 = Tensor::buffer(dt_logits, {num_groups, hidden_size_merged}, rsrc.memory_pool);
-                    linear(ds_fc1, ds_norm, w_mlp_0[0], 1.0, 0.0, b_mlp_0[0], nullptr);
-
-                    auto ds_gelu = Tensor::buffer(dt_logits, {num_groups, hidden_size_merged}, rsrc.memory_pool);
-                    getInferenceContext().gelu(ds_gelu, ds_fc1);
-
-                    auto ds_out = Tensor::buffer(dt_logits, {num_groups, d}, rsrc.memory_pool);
-                    linear(ds_out, ds_gelu, w_mlp_2[0], 1.0, 0.0, b_mlp_2[0], nullptr);
-
-                    deepstack_features.push_back(ds_out);
-                }
-            }
-
-            // 特征concat: [hidden_states] + deepstack_feature_lists
+            // 按照vLLM方式连接特征: [main_features] + deepstack_features (在特征维度连接)
             if (!deepstack_features.empty()) {
                 uint32_t total_dim = d * (1 + deepstack_features.size());
                 auto concat_embeds = Tensor::buffer(dt_logits, {num_groups, total_dim}, rsrc.memory_pool);
@@ -402,7 +416,7 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
                     merger_out->data(),
                     dsize(dt_logits) * num_groups * d, INFINIRT_MEMCPY_D2D, stream));
 
-                // 复制deepstack特征
+                // 复制deepstack特征（按照提取顺序）
                 for (size_t i = 0; i < deepstack_features.size(); ++i) {
                     RUN_INFINI(infinirtMemcpyAsync(
                         concat_embeds->data((i + 1) * num_groups * d),
@@ -473,8 +487,7 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
         linear(v_buf, logits_out,
                weight->w_attn_v[layer],
                1.0, 0.0, nullptr, has_qkv_bias ? weight->b_attn_v[layer] : nullptr);
-        // todo 3d mrope
-        // LLM 使用 3D mRoPE（positions 形状应为 (3, ntok)）
+        // 3d mrope, pos_ids形状为[patches+text_len, 3]
         if (llm_pos_ids_buf && rope_section_buf) {
             mrope_3d(q_buf->view({nh, ntok, dh}), q_buf->view({nh, ntok, dh}), llm_pos_ids_buf, weight->sin_table, weight->cos_table, rope_section_buf);
             mrope_3d(k_buf->view({nkvh, ntok, dh}), k_buf->view({nkvh, ntok, dh}), llm_pos_ids_buf, weight->sin_table, weight->cos_table, rope_section_buf);

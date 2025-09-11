@@ -329,6 +329,12 @@ class Qwen3VLBatchedTask:
         self.rope_section = None
         self.rope_section_len = 0
 
+        # 构造 deepstack_layers 参数
+        vision_config = getattr(config, 'vision_config', {})
+        deepstack_visual_indexes = getattr(vision_config, 'deepstack_visual_multiscale_indexes', [3, 6, 9])
+        self.deepstack_layers = (c_uint * len(deepstack_visual_indexes))(*deepstack_visual_indexes)
+        self.deepstack_layers_len = len(deepstack_visual_indexes)
+
         if self.has_vision and hasattr(self, 'num_patches') and self.num_patches > 0:
             # 构造 llm_pos_ids [patches+text_len, 3] 其中 3 表示 (t, h, w)
             patches_plus_text = self.num_patches + self.ntok
@@ -352,8 +358,8 @@ class Qwen3VLBatchedTask:
             self.llm_pos_ids = (c_uint * self.llm_pos_ids_len)(*llm_pos_ids_flat)
 
             # 构造 rope_section [3] = [t_max, h_max, w_max]
-            # 根据vLLM的设置：通常为[24, 20, 20]
-            rope_section_vals = [24, 20, 20]
+            # 从config读取，默认为[24, 20, 20]
+            rope_section_vals = getattr(config, 'rope_scaling', {}).get('mrope_section', [24, 20, 20])
             self.rope_section_len = 3
             self.rope_section = (c_uint * 3)(*rope_section_vals)
 
