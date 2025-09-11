@@ -191,6 +191,38 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
                pads, strides, dilations);
         auto vit_hidden = conv_output->view({num_patches, vision_hidden_size});
 
+        // ===== 添加绝对位置编码（与vLLM流程一致）=====
+        if (weight->w_v_pos_embed.size() > 0 && weight->w_v_pos_embed[0]) {
+            // 实现fast_pos_embed_interpolate的简化版本
+            // 对于单图推理，我们使用线性插值来调整位置编码到当前图像尺寸
+            auto pos_embed_weight = weight->w_v_pos_embed[0]; // [num_pos, vision_hidden_size]
+            auto pos_embed_out = Tensor::buffer(dt_logits, {num_patches, vision_hidden_size}, rsrc.memory_pool);
+
+            // 简化版本：直接取前num_patches个位置编码（假设位置编码表足够大）
+            uint32_t available_pos = std::min(num_patches, static_cast<uint32_t>(pos_embed_weight->shape()[0]));
+            if (available_pos > 0) {
+                RUN_INFINI(infinirtMemcpyAsync(
+                    pos_embed_out->data(),
+                    pos_embed_weight->data(),
+                    dsize(dt_logits) * available_pos * vision_hidden_size,
+                    INFINIRT_MEMCPY_D2D, stream));
+
+                // 如果num_patches > available_pos，用零填充剩余部分
+                if (num_patches > available_pos) {
+                    auto zero_tensor = Tensor::buffer(dt_logits, {(num_patches - available_pos), vision_hidden_size}, rsrc.memory_pool);
+                    // 将零张量数据复制到位置编码输出的剩余部分
+                    RUN_INFINI(infinirtMemcpyAsync(
+                        pos_embed_out->data(available_pos * vision_hidden_size),
+                        zero_tensor->data(),
+                        dsize(dt_logits) * (num_patches - available_pos) * vision_hidden_size,
+                        INFINIRT_MEMCPY_D2D, stream));
+                }
+
+                // 添加位置编码到patch embeddings: vit_hidden = vit_hidden + pos_embeds
+                add(vit_hidden, vit_hidden, pos_embed_out);
+            }
+        }
+
         // ===== ViT blocks: 使用视觉权重与 2D mRoPE =====
         uint32_t vision_layers = static_cast<uint32_t>(meta->vision_layers);
         uint32_t vision_heads = static_cast<uint32_t>(meta->vision_heads);
