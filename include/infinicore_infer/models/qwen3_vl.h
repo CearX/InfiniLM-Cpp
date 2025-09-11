@@ -57,6 +57,12 @@ destroyQwen3VLModel(struct Qwen3VLModel *);
 /// @param nreq 请求数量
 /// @param req_lens 每个请求的 token 数量
 /// @param req_pos 每个请求的起始位置
+/// @param pos_ids ViT位置编码，格式[patches, 2] (h,w)
+/// @param pos_ids_len pos_ids数组长度，应为patches*2
+/// @param llm_pos_ids LLM 3D mRoPE位置编码，格式[patches+text_len, 3] (t,h,w)
+/// @param llm_pos_ids_len llm_pos_ids数组长度，应为(patches+text_len)*3
+/// @param rope_section 3D mRoPE区段配置，格式[3] (t_max,h_max,w_max)
+/// @param rope_section_len rope_section数组长度，应为3
 /// @param kv_caches 每个请求的 KV Cache
 /// @param temperature 采样温度（0. 表示贪心采样）
 /// @param topk 采样 topk（1 表示贪心采样）
@@ -67,6 +73,8 @@ inferBatchQwen3VL(struct Qwen3VLModel *,
                   const uint32_t *tokens, uint32_t ntok,
                   const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
                   const uint32_t *pos_ids, uint32_t pos_ids_len,
+                  const uint32_t *llm_pos_ids, uint32_t llm_pos_ids_len,
+                  const uint32_t *rope_section, uint32_t rope_section_len,
                   const float *pixel_values,
                   struct KVCache **kv_caches,
                   const float *temperature, const uint32_t *topk, const float *topp,
@@ -78,6 +86,12 @@ inferBatchQwen3VL(struct Qwen3VLModel *,
 /// @param nreq 请求数量
 /// @param req_lens 每个请求的 token 数量
 /// @param req_pos 每个请求的起始位置
+/// @param pos_ids ViT位置编码，格式[patches, 2] (h,w)
+/// @param pos_ids_len pos_ids数组长度，应为patches*2
+/// @param llm_pos_ids LLM 3D mRoPE位置编码，格式[patches+text_len, 3] (t,h,w)
+/// @param llm_pos_ids_len llm_pos_ids数组长度，应为(patches+text_len)*3
+/// @param rope_section 3D mRoPE区段配置，格式[3] (t_max,h_max,w_max)
+/// @param rope_section_len rope_section数组长度，应为3
 /// @param kv_caches 每个请求的 KV Cache
 /// @param logits 输出 token 数组，每个请求一个输出，长度至少为nreq
 __C __export void
@@ -85,6 +99,8 @@ forwardBatchQwen3VL(struct Qwen3VLModel *,
                     const uint32_t *tokens, uint32_t ntok,
                     const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
                     const uint32_t *pos_ids, uint32_t pos_ids_len,
+                    const uint32_t *llm_pos_ids, uint32_t llm_pos_ids_len,
+                    const uint32_t *rope_section, uint32_t rope_section_len,
                     const float *pixel_values,
                     struct KVCache **kv_caches,
                     void *logits);

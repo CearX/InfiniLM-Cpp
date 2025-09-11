@@ -91,6 +91,10 @@ class Qwen3VLModel(BaseModel):
             POINTER(c_uint),
             POINTER(c_uint),
             c_uint,
+            POINTER(c_uint),  # llm_pos_ids
+            c_uint,          # llm_pos_ids_len
+            POINTER(c_uint),  # rope_section
+            c_uint,          # rope_section_len
             c_void_p,
             POINTER(POINTER(KVCacheCStruct)),
             POINTER(c_float),
@@ -108,6 +112,10 @@ class Qwen3VLModel(BaseModel):
             POINTER(c_uint),
             POINTER(c_uint),
             c_uint,
+            POINTER(c_uint),  # llm_pos_ids
+            c_uint,          # llm_pos_ids_len
+            POINTER(c_uint),  # rope_section
+            c_uint,          # rope_section_len
             c_void_p,
             POINTER(POINTER(KVCacheCStruct)),
             c_void_p,
@@ -151,6 +159,10 @@ class Qwen3VLModel(BaseModel):
         req_pos,
         pos_ids,
         pos_ids_len,
+        llm_pos_ids,
+        llm_pos_ids_len,
+        rope_section,
+        rope_section_len,
         pixel_values,
         kv_caches,
         temperature,
@@ -167,6 +179,10 @@ class Qwen3VLModel(BaseModel):
             req_pos,
             pos_ids,
             pos_ids_len,
+            llm_pos_ids,
+            llm_pos_ids_len,
+            rope_section,
+            rope_section_len,
             pixel_values,
             kv_caches,
             temperature,
@@ -176,8 +192,12 @@ class Qwen3VLModel(BaseModel):
         )
 
     def forward_batch(
-        self, model, tokens, ntok, req_lens, nreq, req_pos, pos_ids, pos_ids_len, pixel_values, kv_caches, logits
+        self, model, tokens, ntok, req_lens, nreq, req_pos, pos_ids, pos_ids_len,
+        llm_pos_ids, llm_pos_ids_len, rope_section, rope_section_len,
+        pixel_values, kv_caches, logits
     ):
         self.lib.forwardBatchQwen3VL(
-            model, tokens, ntok, req_lens, nreq, req_pos, pos_ids, pos_ids_len, pixel_values, kv_caches, logits
+            model, tokens, ntok, req_lens, nreq, req_pos, pos_ids, pos_ids_len,
+            llm_pos_ids, llm_pos_ids_len, rope_section, rope_section_len,
+            pixel_values, kv_caches, logits
         )

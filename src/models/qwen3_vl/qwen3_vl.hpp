@@ -74,7 +74,7 @@ struct InferRequest {
     const uint32_t *req_lens;
     uint32_t nreq;
     const uint32_t *req_pos;
-    const uint32_t *pos_ids;
+    const uint32_t *pos_ids; // ViT/vision positions (e.g., [patches,2] or [patches,3])
     uint32_t pos_ids_len;
     const float *pixel_values;
     struct KVCache **kv_caches;
@@ -83,6 +83,12 @@ struct InferRequest {
     const float *topp;
     uint32_t *output;
     void *logits;
+
+    // LLM 3D mRoPE positions and rope_section
+    const uint32_t *llm_pos_ids;  // shape (3, ntok) flattened, or nullptr
+    uint32_t llm_pos_ids_len;     // must be 3*ntok if provided
+    const uint32_t *rope_section; // shape (3,), or nullptr
+    uint32_t rope_section_len;    // must be 3 if provided
 };
 
 struct InferState {

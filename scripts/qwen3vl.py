@@ -296,7 +296,7 @@ class Qwen3VLBatchedTask:
             try:
                 pos_ids = compute_2d_mrope_pos_ids(self.grid_thw)
                 for pos in pos_ids:
-                    flat_pos_ids.extend([int(pos[0]), int(pos[1])])
+                    flat_pos_ids.extend([int(pos[0].item()), int(pos[1].item())])
                 self.has_vision = True
                 self.vision_pos_shape = pos_ids.shape
             except Exception as e:
@@ -309,18 +309,53 @@ class Qwen3VLBatchedTask:
                     flat_pos_ids.extend([i, 0])
             self.has_vision = False
 
-        self.pos_ids_len = len(flat_pos_ids)
-
         # Convert to ctypes arrays in one pass
         self.tokens = (c_uint * self.ntok)(*flat_tokens)
         self.req_lens = (c_uint * self.nreq)(*self.req_lens_list)
         self.req_pos = (c_uint * self.nreq)(*self.req_pos_list)
-        self.pos_ids = (c_uint * max(1, self.pos_ids_len))(*([0] + flat_pos_ids)[:max(1, self.pos_ids_len)])
+        # 确保 flat_pos_ids 都是整数并构造 ctypes 数组
+        safe_pos_ids = [int(x) for x in flat_pos_ids] if flat_pos_ids else [0]
+        self.pos_ids = (c_uint * len(safe_pos_ids))(*safe_pos_ids)
+        self.pos_ids_len = len(safe_pos_ids)
         self.kv_caches = (POINTER(KVCacheCStruct) *
                           self.nreq)(*self.kv_cache_ptrs)
         self.temperaturas = (c_float * self.nreq)(*self.temperaturas_list)
         self.topks = (c_uint * self.nreq)(*self.topks_list)
         self.topps = (c_float * self.nreq)(*self.topps_list)
+
+        # 构造 3D mRoPE 参数
+        self.llm_pos_ids = None
+        self.llm_pos_ids_len = 0
+        self.rope_section = None
+        self.rope_section_len = 0
+
+        if self.has_vision and hasattr(self, 'num_patches') and self.num_patches > 0:
+            # 构造 llm_pos_ids [patches+text_len, 3] 其中 3 表示 (t, h, w)
+            patches_plus_text = self.num_patches + self.ntok
+            llm_pos_ids_flat = []
+
+            # 为视觉patches构造位置: t=0 (单帧), h和w从原始pos_ids获取
+            for i in range(self.num_patches):
+                t_pos = 0  # 单帧视频，t维度为0
+                h_pos = flat_pos_ids[i * 2] if i * 2 < len(flat_pos_ids) else 0
+                w_pos = flat_pos_ids[i * 2 + 1] if i * 2 + 1 < len(flat_pos_ids) else 0
+                llm_pos_ids_flat.extend([t_pos, h_pos, w_pos])
+
+            # 为文本tokens构造位置: t递增, h=0, w=0
+            for i in range(self.ntok):
+                t_pos = self.num_patches + i  # 时间维度接续视觉tokens
+                h_pos = 0
+                w_pos = 0
+                llm_pos_ids_flat.extend([t_pos, h_pos, w_pos])
+
+            self.llm_pos_ids_len = len(llm_pos_ids_flat)
+            self.llm_pos_ids = (c_uint * self.llm_pos_ids_len)(*llm_pos_ids_flat)
+
+            # 构造 rope_section [3] = [t_max, h_max, w_max]
+            # 根据vLLM的设置：通常为[24, 20, 20]
+            rope_section_vals = [24, 20, 20]
+            self.rope_section_len = 3
+            self.rope_section = (c_uint * 3)(*rope_section_vals)
 
     def input_args(self):
         # pixel_values 作为裸指针传递；无视觉输入则传空指针
@@ -331,6 +366,10 @@ class Qwen3VLBatchedTask:
         else:
             pixel_values_ptr = c_void_p(0)
 
+        # 处理3D mRoPE参数的空指针
+        llm_pos_ids_ptr = self.llm_pos_ids if self.llm_pos_ids is not None else POINTER(c_uint)()
+        rope_section_ptr = self.rope_section if self.rope_section is not None else POINTER(c_uint)()
+
         return (
             self.tokens,
             self.ntok,
@@ -339,6 +378,10 @@ class Qwen3VLBatchedTask:
             self.req_pos,
             self.pos_ids,
             self.pos_ids_len,
+            llm_pos_ids_ptr,
+            self.llm_pos_ids_len,
+            rope_section_ptr,
+            self.rope_section_len,
             pixel_values_ptr,
             self.kv_caches,
             self.temperaturas,
@@ -526,17 +569,13 @@ class Qwen3VLForCausalLM:
                 (batch_inputs.ntok, self.meta.dvoc), dtype=self.meta.torch_dtype_logits
             )
             # 评测路径：decode阶段不传像素；传递pos_ids以保持mrope输入稳定
+            # 简化forward_batch调用：使用input_args()展开，但需要插入decode专用的空pixel_values
+            args = list(batch_inputs.input_args())
+            args[11] = c_void_p(0)  # 替换pixel_values为空指针（decode阶段不传像素）
+
             self.qwen3vl_model.forward_batch(
                 self.model_instance,
-                batch_inputs.tokens,
-                batch_inputs.ntok,
-                batch_inputs.req_lens,
-                batch_inputs.nreq,
-                batch_inputs.req_pos,
-                batch_inputs.pos_ids,
-                batch_inputs.pos_ids_len,
-                c_void_p(0),
-                batch_inputs.kv_caches,
+                *args,
                 logits.data_ptr(),
             )
 

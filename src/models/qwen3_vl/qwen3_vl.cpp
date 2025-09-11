@@ -50,6 +50,8 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
                       const uint32_t *tokens, uint32_t ntok,
                       const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
                       const uint32_t *pos_ids, uint32_t pos_ids_len,
+                      const uint32_t *llm_pos_ids, uint32_t llm_pos_ids_len,
+                      const uint32_t *rope_section, uint32_t rope_section_len,
                       const float *pixel_values, uint32_t /*is_vision_mode*/, // 视觉数据指针，是否视觉模式不再需要
                       struct KVCache **kv_caches,
                       const float *temperature, const uint32_t *topk, const float *topp,
@@ -96,14 +98,59 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
     // printf("here1\n");
 
     // 统一路径：若有视觉输入，先跑ViT得到visual_embeds；随后构建logits_in（视觉token用visual_embeds替换）
-    std::shared_ptr<Tensor> pos_ids_buf;
-    uint32_t num_patches = (pos_ids_len >= 2) ? (pos_ids_len / 2) : 0;
-    if (pos_ids != nullptr && num_patches > 0) {
-        if (rsrc.device == INFINI_DEVICE_CPU) {
-            pos_ids_buf = Tensor::weight(const_cast<uint32_t *>(pos_ids), INFINI_DTYPE_U32, {num_patches, 2});
-        } else {
-            pos_ids_buf = Tensor::buffer(INFINI_DTYPE_U32, {num_patches, 2}, rsrc.memory_pool);
-            RUN_INFINI(infinirtMemcpyAsync(pos_ids_buf->data(), pos_ids, sizeof(uint32_t) * pos_ids_len,
+    std::shared_ptr<Tensor> vision_pos_ids_buf; // for ViT [patches, 2]
+    std::shared_ptr<Tensor> llm_pos_ids_buf;    // for LLM [patches+text_len, 3] - TODO: wire from API
+    std::shared_ptr<Tensor> rope_section_buf;   // rope_section [3,] - TODO: wire from API
+    uint32_t num_patches = 0;
+
+    // Vision pos_ids: 严格验证 [patches, 2] 格式 (h, w)
+    if (pos_ids != nullptr && pos_ids_len > 0) {
+        if (pos_ids_len % 2 != 0) {
+            // 错误：pos_ids长度必须是偶数，表示(h,w)对
+            printf("Error: pos_ids_len (%u) must be even for 2D mRoPE [patches, 2] format\n", pos_ids_len);
+            return; // 或者抛出异常
+        }
+        num_patches = pos_ids_len / 2;
+        if (num_patches == 0) {
+            printf("Error: num_patches cannot be zero for 2D mRoPE\n");
+            return;
+        }
+
+        vision_pos_ids_buf = (rsrc.device == INFINI_DEVICE_CPU)
+                               ? Tensor::weight(const_cast<uint32_t *>(pos_ids), INFINI_DTYPE_U32, {num_patches, 2})
+                               : Tensor::buffer(INFINI_DTYPE_U32, {num_patches, 2}, rsrc.memory_pool);
+        if (rsrc.device != INFINI_DEVICE_CPU) {
+            RUN_INFINI(infinirtMemcpyAsync(vision_pos_ids_buf->data(), pos_ids, sizeof(uint32_t) * pos_ids_len,
+                                           INFINIRT_MEMCPY_H2D, stream));
+        }
+    }
+
+    // LLM 3D mRoPE参数处理：验证并构建llm_pos_ids和rope_section缓冲区
+    if (llm_pos_ids != nullptr && llm_pos_ids_len > 0) {
+        if (llm_pos_ids_len % 3 != 0) {
+            printf("Error: llm_pos_ids_len (%u) must be divisible by 3 for 3D mRoPE [patches+text_len, 3] format\n", llm_pos_ids_len);
+            return;
+        }
+        uint32_t total_tokens = llm_pos_ids_len / 3;
+        llm_pos_ids_buf = (rsrc.device == INFINI_DEVICE_CPU)
+                            ? Tensor::weight(const_cast<uint32_t *>(llm_pos_ids), INFINI_DTYPE_U32, {total_tokens, 3})
+                            : Tensor::buffer(INFINI_DTYPE_U32, {total_tokens, 3}, rsrc.memory_pool);
+        if (rsrc.device != INFINI_DEVICE_CPU) {
+            RUN_INFINI(infinirtMemcpyAsync(llm_pos_ids_buf->data(), llm_pos_ids, sizeof(uint32_t) * llm_pos_ids_len,
+                                           INFINIRT_MEMCPY_H2D, stream));
+        }
+    }
+
+    if (rope_section != nullptr && rope_section_len > 0) {
+        if (rope_section_len != 3) {
+            printf("Error: rope_section_len (%u) must be exactly 3 for [t_max, h_max, w_max] format\n", rope_section_len);
+            return;
+        }
+        rope_section_buf = (rsrc.device == INFINI_DEVICE_CPU)
+                             ? Tensor::weight(const_cast<uint32_t *>(rope_section), INFINI_DTYPE_U32, {3})
+                             : Tensor::buffer(INFINI_DTYPE_U32, {3}, rsrc.memory_pool);
+        if (rsrc.device != INFINI_DEVICE_CPU) {
+            RUN_INFINI(infinirtMemcpyAsync(rope_section_buf->data(), rope_section, sizeof(uint32_t) * 3,
                                            INFINIRT_MEMCPY_H2D, stream));
         }
     }
@@ -132,6 +179,7 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
                                            INFINIRT_MEMCPY_H2D, stream));
         }
 
+        // ==== ViT正确流程：patch_embed -> vit_blocks -> merger ====
         auto conv_output = Tensor::buffer(dt_logits, {num_patches, vision_hidden_size, 1, 1, 1}, rsrc.memory_pool);
         std::vector<int64_t> pads = {0, 0, 0};
         std::vector<int64_t> strides = {int64_t(temporal_patch_size), int64_t(patch_size), int64_t(patch_size)};
@@ -141,7 +189,6 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
                weight->w_v_patch_embed_proj[0],
                weight->b_v_patch_embed_proj[0],
                pads, strides, dilations);
-        // ==== ViT正确流程：patch_embed -> vit_blocks -> merger ====
         auto vit_hidden = conv_output->view({num_patches, vision_hidden_size});
 
         // ===== ViT blocks: 使用视觉权重与 2D mRoPE =====
@@ -172,12 +219,12 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
             rearrange(vit_k, vit_qkv->slice(1, vision_hidden_size, vision_hidden_size));
             rearrange(vit_v, vit_qkv->slice(1, 2u * vision_hidden_size, vision_hidden_size));
 
-            // 2D mRoPE on q,k: 视角 heads 维度
-            if (pos_ids_buf) {
+            // 2D mRoPE on q,k: 使用 ViT 专用 (h,w) 位置编码
+            if (vision_pos_ids_buf) {
                 auto q_view = vit_q->view({vision_heads, num_patches, dh_v});
                 auto k_view = vit_k->view({vision_heads, num_patches, dh_v});
-                mrope_2d(q_view, q_view, pos_ids_buf, weight->sin_table_v, weight->cos_table_v);
-                mrope_2d(k_view, k_view, pos_ids_buf, weight->sin_table_v, weight->cos_table_v);
+                mrope_2d(q_view, q_view, vision_pos_ids_buf, weight->sin_table_v, weight->cos_table_v);
+                mrope_2d(k_view, k_view, vision_pos_ids_buf, weight->sin_table_v, weight->cos_table_v);
             }
 
             // Self-Attention: QK^T -> softmax -> *V
@@ -186,8 +233,8 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
                 auto k_view = vit_k->view({vision_heads, dh_v, num_patches});
                 auto qk_view = qk_v_buf->view({vision_heads, num_patches, num_patches});
                 linear(qk_view, q_view, k_view, 1.f / float(sqrt(dh_v)), 0.f, nullptr, nullptr);
-                // NOTE: 当前仅有因果 softmax，可替换为普通 softmax 后更贴合 ViT
-                causalSoftmax(qk_view, qk_view);
+                // ViT 使用非因果 softmax (无 mask)
+                softmax(qk_view, qk_view);
                 auto v_view = vit_v->view({vision_heads, num_patches, dh_v});
                 linear(attn_val_v, qk_view, v_view, 1.f, 0.f, nullptr, nullptr);
             }
@@ -382,13 +429,23 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
         linear(k_buf, logits_out,
                weight->w_attn_k[layer],
                1.0, 0.0, nullptr, has_qkv_bias ? weight->b_attn_k[layer] : nullptr);
+        // q/k-norm（实际是 RMSNorm，按 vLLM 实现）
+        if (weight->w_q_norm.size() > layer && weight->w_k_norm.size() > layer) {
+            auto q_norm_buf = Tensor::buffer(dt_logits, {ntok, nh * dh}, rsrc.memory_pool);
+            auto k_norm_buf = Tensor::buffer(dt_logits, {ntok, nkvh * dh}, rsrc.memory_pool);
+            rmsnorm(q_norm_buf, q_buf, weight->w_q_norm[layer], meta->epsilon);
+            rmsnorm(k_norm_buf, k_buf, weight->w_k_norm[layer], meta->epsilon);
+            rearrange(q_buf, q_norm_buf);
+            rearrange(k_buf, k_norm_buf);
+        }
         linear(v_buf, logits_out,
                weight->w_attn_v[layer],
                1.0, 0.0, nullptr, has_qkv_bias ? weight->b_attn_v[layer] : nullptr);
         // todo 3d mrope
-        if (pos_ids_buf) {
-            mrope_2d(q_buf->view({nh, ntok, dh}), q_buf->view({nh, ntok, dh}), pos_ids_buf, weight->sin_table, weight->cos_table);
-            mrope_2d(k_buf->view({nkvh, ntok, dh}), k_buf->view({nkvh, ntok, dh}), pos_ids_buf, weight->sin_table, weight->cos_table);
+        // LLM 使用 3D mRoPE（positions 形状应为 (3, ntok)）
+        if (llm_pos_ids_buf && rope_section_buf) {
+            mrope_3d(q_buf->view({nh, ntok, dh}), q_buf->view({nh, ntok, dh}), llm_pos_ids_buf, weight->sin_table, weight->cos_table, rope_section_buf);
+            mrope_3d(k_buf->view({nkvh, ntok, dh}), k_buf->view({nkvh, ntok, dh}), llm_pos_ids_buf, weight->sin_table, weight->cos_table, rope_section_buf);
         }
 
         // printf("here5.1\n");
@@ -509,6 +566,8 @@ inferBatchQwen3VL(struct Qwen3VLModel *model,
                   const uint32_t *tokens, uint32_t ntok,
                   const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
                   const uint32_t *pos_ids, uint32_t pos_ids_len,
+                  const uint32_t *llm_pos_ids, uint32_t llm_pos_ids_len,
+                  const uint32_t *rope_section, uint32_t rope_section_len,
                   const float *pixel_values,
                   struct KVCache **kv_caches,
                   const float *temperature, const uint32_t *topk, const float *topp,
@@ -520,6 +579,10 @@ inferBatchQwen3VL(struct Qwen3VLModel *model,
     model->req.req_pos = req_pos;
     model->req.pos_ids = pos_ids;
     model->req.pos_ids_len = pos_ids_len;
+    model->req.llm_pos_ids = llm_pos_ids;
+    model->req.llm_pos_ids_len = llm_pos_ids_len;
+    model->req.rope_section = rope_section;
+    model->req.rope_section_len = rope_section_len;
     model->req.pixel_values = pixel_values;
     model->req.kv_caches = kv_caches;
     model->req.output = output;
@@ -547,6 +610,8 @@ forwardBatchQwen3VL(struct Qwen3VLModel *model,
                     const uint32_t *tokens, uint32_t ntok,
                     const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
                     const uint32_t *pos_ids, uint32_t pos_ids_len,
+                    const uint32_t *llm_pos_ids, uint32_t llm_pos_ids_len,
+                    const uint32_t *rope_section, uint32_t rope_section_len,
                     const float *pixel_values,
                     struct KVCache **kv_caches,
                     void *logits) {
@@ -557,6 +622,10 @@ forwardBatchQwen3VL(struct Qwen3VLModel *model,
     model->req.req_pos = req_pos;
     model->req.pos_ids = pos_ids;
     model->req.pos_ids_len = pos_ids_len;
+    model->req.llm_pos_ids = llm_pos_ids;
+    model->req.llm_pos_ids_len = llm_pos_ids_len;
+    model->req.rope_section = rope_section;
+    model->req.rope_section_len = rope_section_len;
     model->req.pixel_values = pixel_values;
     model->req.kv_caches = kv_caches;
     model->req.output = nullptr;
@@ -608,6 +677,7 @@ void launchDevice(const Qwen3VLMeta *meta, std::shared_ptr<Qwen3VLDeviceWeight> 
 
         inferDeviceBatch(meta, *rsrc, idev, ndev, req.tokens, req.ntok,
                          req.req_lens, req.nreq, req.req_pos, req.pos_ids, req.pos_ids_len,
+                         req.llm_pos_ids, req.llm_pos_ids_len, req.rope_section, req.rope_section_len,
                          req.pixel_values, 0,
                          req.kv_caches, req.temperature, req.topk, req.topp, req.output, req.logits);
 

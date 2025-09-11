@@ -165,6 +165,7 @@ public:
     DECLARE_OP_CACHE(MRoPE3D)
     DECLARE_OP_CACHE(Rearrange)
     DECLARE_OP_CACHE(CausalSoftmax)
+    DECLARE_OP_CACHE(Softmax)
     DECLARE_OP_CACHE(Topkrouter)
     DECLARE_OP_CACHE(SwiGLU)
     DECLARE_OP_CACHE(RandomSample)
@@ -183,6 +184,7 @@ public:
           MRoPE3D_cache(capacity, DESTROY_FUNC(MRoPE3D)),
           Rearrange_cache(capacity, DESTROY_FUNC(Rearrange)),
           CausalSoftmax_cache(capacity, DESTROY_FUNC(CausalSoftmax)),
+          Softmax_cache(capacity, DESTROY_FUNC(Softmax)),
           Topkrouter_cache(capacity, DESTROY_FUNC(Topkrouter)),
           SwiGLU_cache(capacity, DESTROY_FUNC(SwiGLU)),
           RandomSample_cache(capacity, DESTROY_FUNC(RandomSample)),

@@ -58,6 +58,62 @@ inline std::shared_ptr<Tensor> getCosTable(size_t dctx, size_t dh, float theta, 
     return tensor;
 }
 
+inline std::shared_ptr<Tensor> getSinTable_llm(size_t dctx, size_t dh, float theta, infiniDtype_t dtype) {
+    auto half_dh = dh / 2; // 3dmrope sin/cos 和普通rope一样
+    auto unit = dsize(dtype);
+    void *table = std::malloc(dctx * half_dh * unit);
+
+    for (size_t i = 0; i < dctx; i++) {
+        for (size_t j = 0; j < half_dh; j++) {
+            float _sin = std::sin(
+                static_cast<float>(i) / std::pow(theta, static_cast<float>(j) / half_dh));
+
+            if (dtype == INFINI_DTYPE_F16) {
+                ((uint16_t *)table)[i * half_dh + j] = f32_to_f16(_sin);
+            } else if (dtype == INFINI_DTYPE_BF16) {
+                ((uint16_t *)table)[i * half_dh + j] = f32_to_bf16(_sin);
+            } else if (dtype == INFINI_DTYPE_F32) {
+                ((float *)table)[i * half_dh + j] = _sin;
+            } else {
+                std::cout << "Sin table unsupported dtype" << std::endl;
+                std::abort();
+            }
+        }
+    }
+    auto shape = std::vector<size_t>({dctx, half_dh});
+    auto tensor = Tensor::weight(table, dtype, shape);
+    std::free(table);
+    return tensor;
+}
+
+inline std::shared_ptr<Tensor> getCosTable_llm(size_t dctx, size_t dh, float theta, infiniDtype_t dtype) {
+    auto half_dh = dh / 2; // 3dmrope sin/cos 和普通rope一样
+    auto unit = dsize(dtype);
+    void *table = std::malloc(dctx * half_dh * unit);
+
+    for (size_t i = 0; i < dctx; i++) {
+        for (size_t j = 0; j < half_dh; j++) {
+            float _cos = std::cos(
+                static_cast<float>(i) / std::pow(theta, static_cast<float>(j) / half_dh));
+
+            if (dtype == INFINI_DTYPE_F16) {
+                ((uint16_t *)table)[i * half_dh + j] = f32_to_f16(_cos);
+            } else if (dtype == INFINI_DTYPE_BF16) {
+                ((uint16_t *)table)[i * half_dh + j] = f32_to_bf16(_cos);
+            } else if (dtype == INFINI_DTYPE_F32) {
+                ((float *)table)[i * half_dh + j] = _cos;
+            } else {
+                std::cout << "Cos table unsupported dtype" << std::endl;
+                std::abort();
+            }
+        }
+    }
+    auto shape = std::vector<size_t>({dctx, half_dh});
+    auto tensor = Tensor::weight(table, dtype, shape);
+    std::free(table);
+    return tensor;
+}
+
 Qwen3VLWeights::Qwen3VLWeights(
     const Qwen3VLMeta *meta,
     infiniDevice_t device,

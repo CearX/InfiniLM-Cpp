@@ -4,6 +4,7 @@
 #include "infiniop/ops/conv.h"
 #include "infiniop/ops/gelu.h"
 #include "infiniop/ops/layer_norm.h"
+#include "infiniop/ops/softmax.h"
 
 InferenceContext::InferenceContext(infiniopHandle_t op_handle_, std::shared_ptr<MemoryPool> memory_pool_, CacheManager *cache_manager, infinirtStream_t stream)
     : op_handle(op_handle_), memory_pool(memory_pool_), cache_manager(cache_manager), stream(stream) {}
@@ -246,6 +247,26 @@ void InferenceContext::causalSoftmax(std::shared_ptr<Tensor> y,
 
     RUN_INFINI(infiniopCausalSoftmax(desc, workspace, workspace_size,
                                      y->data(), x->data(), stream));
+}
+
+void InferenceContext::softmax(std::shared_ptr<Tensor> y,
+                               std::shared_ptr<Tensor> x) {
+    size_t key = CacheManager::createDescriptorKey(y, x);
+
+    infiniopSoftmaxDescriptor_t desc;
+    if (!cache_manager->getSoftmaxDescriptor(key, desc)) {
+        RUN_INFINI(infiniopCreateSoftmaxDescriptor(
+            op_handle, &desc, y->desc(), x->desc()));
+        cache_manager->putSoftmaxDescriptor(key, desc);
+    }
+
+    size_t workspace_size = 0;
+    RUN_INFINI(infiniopGetSoftmaxWorkspaceSize(desc, &workspace_size));
+    ensure_workspace(workspace_size);
+    void *workspace = workspace_storage->memory();
+
+    RUN_INFINI(infiniopSoftmax(desc, workspace, workspace_size,
+                               y->data(), x->data(), stream));
 }
 
 void InferenceContext::topkrouter(std::shared_ptr<Tensor> values,  // F32
