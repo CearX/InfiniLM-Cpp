@@ -78,6 +78,7 @@ Qwen3VLWeights::Qwen3VLWeights(
     // Vision encoder parameters
     size_t vision_hidden_size = meta->vision_hidden_size;
     size_t vision_layers = meta->vision_layers;
+    size_t vision_heads = meta->vision_heads;
     size_t patch_size = meta->patch_size;
 
     for (size_t i = 0; i < ndev; i++) {
@@ -100,6 +101,11 @@ Qwen3VLWeights::Qwen3VLWeights(
 
         weight->sin_table = getSinTable(dctx, dh, meta->theta, dt_logits);
         weight->cos_table = getCosTable(dctx, dh, meta->theta, dt_logits);
+
+        // 视觉 mRoPE 表（2D）：按 vision head 维度构建
+        size_t dh_v = vision_heads > 0 ? (vision_hidden_size / vision_heads) : vision_hidden_size;
+        weight->sin_table_v = getSinTable(dctx, dh_v, meta->theta, dt_logits);
+        weight->cos_table_v = getCosTable(dctx, dh_v, meta->theta, dt_logits);
 
 #define REGISTER_LAYER_WEIGHT_1D(W_NAME, W_VAR, W_DIM, W_DTYPE, W_DIST_TYPE)                     \
     auto W_VAR = Tensor::weight(nullptr, W_DTYPE, {W_DIM});                                      \

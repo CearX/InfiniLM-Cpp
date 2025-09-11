@@ -449,26 +449,6 @@ class Qwen3VLForCausalLM:
         )
         return list(output)
 
-    def infer_vision_module(self, image_path):
-        """
-        ViT 模块推理：Image → visual_embeddings
-        """
-        # Python 图像预处理
-        pixel_values, grid_thw = preprocess_image_qwen3vl(image_path)
-        pos_ids = compute_2d_mrope_pos_ids(grid_thw)
-
-        # TODO: C++ ViT 推理 (is_vision_mode=True)
-        print(f"ViT 模块推理: {pixel_values.shape} patches")
-        return None  # 占位符
-
-    def infer_llm_module(self, text_tokens, visual_embeddings=None):
-        """
-        LLM 模块推理：Text + visual_embeddings → output
-        """
-        # TODO: C++ LLM 推理 (is_vision_mode=False，自动token替换)
-        print(f"LLM 模块推理: {len(text_tokens)} tokens")
-        return None  # 占位符
-
     def generate(self, input_content, max_steps, topp_=1.0, topk_=1, temperature_=1.0, image_path=None, video_path=None):
         input_content = self.tokenizer.apply_chat_template(
             conversation=[{"role": "user", "content": input_content}],
@@ -619,7 +599,7 @@ def test():
     max_tokens = 1024
     model = Qwen3VLForCausalLM(model_path, device_type, ndev, max_tokens=max_tokens)
     image_path = "/home/cearx/qy/model/Qwen3-VL-2B-Vit-86M-0828/image3.jpg"
-    model.generate("山东最高的山是？", 500, image_path=image_path)
+    model.generate("描述这张图片", 500, image_path=image_path)
     model.destroy_model_instance()
 
 

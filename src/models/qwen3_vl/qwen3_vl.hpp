@@ -11,6 +11,8 @@
 struct Qwen3VLDeviceWeight {
     std::shared_ptr<Tensor> w_in_embd, w_out_norm, w_out_embd, sin_table,
         cos_table;
+    // ViT 专用 2D mRoPE 表
+    std::shared_ptr<Tensor> sin_table_v, cos_table_v;
     std::vector<std::shared_ptr<Tensor>> w_attn_norm, b_attn_q, b_attn_k, b_attn_v, w_ffn_norm;
     std::vector<std::shared_ptr<Tensor>> w_attn_q, w_attn_k, w_attn_v, w_attn_out, w_ffn_gate, w_ffn_up, w_ffn_down;
     std::vector<std::shared_ptr<Tensor>> w_q_norm, w_k_norm;
