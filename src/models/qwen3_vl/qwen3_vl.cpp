@@ -56,6 +56,9 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
                       struct KVCache **kv_caches,
                       const float *temperature, const uint32_t *topk, const float *topp,
                       uint32_t *output, void *last_logits) {
+    // DEBUG: 推理开始
+    printf("[DEBUG] Qwen3VL inferDeviceBatch START: idev=%u, ntok=%u, nreq=%u, has_vision=%s\n",
+           idev, ntok, nreq, (pixel_values != nullptr) ? "true" : "false");
     auto nlayer = meta->nlayer;
     auto nkvh = meta->nkvh / ndev;
     auto nh = meta->nh / ndev;
@@ -163,6 +166,8 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
     std::vector<std::shared_ptr<Tensor>> deepstack_features;
 
     const bool has_vision = (pixel_values != nullptr) && (num_patches > 0);
+    printf("[DEBUG] Vision processing: has_vision=%s, num_patches=%u\n",
+           has_vision ? "true" : "false", num_patches);
     if (has_vision) {
         // 根据权重形状确定实际参数: [vision_hidden_size, 3, temporal, patch, patch]
         uint32_t in_channels = 3;
@@ -232,6 +237,9 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
         uint32_t vision_heads = static_cast<uint32_t>(meta->vision_heads);
         uint32_t dh_v = vision_heads > 0 ? (vision_hidden_size / vision_heads) : vision_hidden_size;
 
+        printf("[DEBUG] ViT configuration: layers=%u, heads=%u, hidden_size=%u, dh_v=%u\n",
+               vision_layers, vision_heads, vision_hidden_size, dh_v);
+
         // Deepstack特征提取在指定层进行
 
         // 缓冲区
@@ -248,8 +256,10 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
         auto attn_val_v = Tensor::buffer(dt_logits, {vision_heads, num_patches, dh_v}, rsrc.memory_pool);
 
         for (uint32_t vlayer = 0; vlayer < vision_layers; ++vlayer) {
-            // LN1
-            layernorm(vit_hidden_out, vit_hidden_in, weight->w_v_norm1[vlayer], weight->b_v_norm1[vlayer], meta->epsilon);
+            printf("[DEBUG] ViT processing layer %u/%u\n", vlayer + 1, vision_layers);
+            // 使用rmsnorm代替layernorm（暂时跳过bias）
+            printf("[DEBUG] Using rmsnorm instead of layernorm...\n");
+            rmsnorm(vit_hidden_out, vit_hidden_in, weight->w_v_norm1[vlayer], meta->epsilon);
             // QKV
             linear(vit_qkv, vit_hidden_out, weight->w_v_attn_qkv[vlayer], 1.0, 0.0, nullptr, weight->b_v_attn_qkv[vlayer]);
             // split q,k,v
@@ -277,20 +287,25 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
                 linear(attn_val_v, qk_view, v_view, 1.f, 0.f, nullptr, nullptr);
             }
 
-            // 合并 heads 并投影
-            auto attn_merged = attn_val_v->view({vision_heads * num_patches, dh_v});
+            // 合并 heads 并投影：[heads, num_patches, dh_v] -> [num_patches, heads*dh_v]
             auto attn_rearranged = Tensor::buffer(dt_logits, {num_patches, vision_hidden_size}, rsrc.memory_pool);
-            // 将 [heads, num_patches, dh_v] 视作 [num_patches, heads*dh_v]
-            rearrange(attn_rearranged, attn_val_v->permute({1, 0, 2})->view({num_patches, vision_hidden_size}));
+            assert(vision_hidden_size == vision_heads * dh_v);
+            // 先将 permute 后的 3D 张量变为连续，再展平
+            auto attn_perm = attn_val_v->permute({1, 0, 2});
+            auto attn_contig = Tensor::buffer(dt_logits, {num_patches, vision_heads, dh_v}, rsrc.memory_pool);
+            rearrange(attn_contig, attn_perm);
+            auto attn_view = attn_contig->view({num_patches, vision_hidden_size});
+            rearrange(attn_rearranged, attn_view);
 
             // out proj + 残差
             linear(vit_hidden_in, attn_rearranged, weight->w_v_attn_proj[vlayer], 1.0, 0.0, vit_hidden_in, weight->b_v_attn_proj[vlayer]);
 
             // FFN
-            layernorm(vit_hidden_out, vit_hidden_in, weight->w_v_norm2[vlayer], weight->b_v_norm2[vlayer], meta->epsilon);
+            rmsnorm(vit_hidden_out, vit_hidden_in, weight->w_v_norm2[vlayer], meta->epsilon);
             auto vit_fc1 = Tensor::buffer(dt_logits, {num_patches, 4u * vision_hidden_size}, rsrc.memory_pool);
             linear(vit_fc1, vit_hidden_out, weight->w_v_mlp_fc1[vlayer], 1.0, 0.0, nullptr, weight->b_v_mlp_fc1[vlayer]);
             auto vit_gelu = Tensor::buffer(dt_logits, {num_patches, 4u * vision_hidden_size}, rsrc.memory_pool);
+            printf("[DEBUG] ViT layer %u: applying GELU activation (should be gelu_pytorch_tanh)\n", vlayer);
             getInferenceContext().gelu(vit_gelu, vit_fc1);
             auto vit_fc2 = Tensor::buffer(dt_logits, {num_patches, vision_hidden_size}, rsrc.memory_pool);
             linear(vit_fc2, vit_gelu, weight->w_v_mlp_fc2[vlayer], 1.0, 0.0, nullptr, weight->b_v_mlp_fc2[vlayer]);
@@ -301,6 +316,7 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
             if (std::find(deepstack_layers.begin(), deepstack_layers.end(), vlayer) != deepstack_layers.end()) {
                 // 提取deepstack特征：使用对应的deepstack merger
                 size_t deepstack_idx = std::find(deepstack_layers.begin(), deepstack_layers.end(), vlayer) - deepstack_layers.begin();
+                printf("[DEBUG] Deepstack feature extraction at layer %u (deepstack_idx=%zu)\n", vlayer, deepstack_idx);
 
                 if (deepstack_idx < 3) { // 最多3个deepstack层
                     const auto &w_ln_q = deepstack_idx == 0 ? weight->w_v_merger_list_0_ln_q
@@ -331,17 +347,19 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
                         // Deepstack merger处理：reshape然后norm+MLP
                         auto ds_input = vit_hidden_in->view({num_groups, hidden_size_merged});
                         auto ds_norm = Tensor::buffer(dt_logits, {num_groups, hidden_size_merged}, rsrc.memory_pool);
-                        layernorm(ds_norm, ds_input, w_ln_q[0], b_ln_q[0], meta->epsilon);
+                        // layernorm(ds_norm, ds_input, w_ln_q[0], b_ln_q[0], meta->epsilon);
+                        rmsnorm(ds_norm, ds_input, w_ln_q[0], meta->epsilon);
+                        printf("b_ln_q[0] size: %zu\n", b_ln_q[0]->shape()[0]);
 
                         auto ds_fc1 = Tensor::buffer(dt_logits, {num_groups, hidden_size_merged}, rsrc.memory_pool);
-                        linear(ds_fc1, ds_norm, w_mlp_0[0], 1.0, 0.0, b_mlp_0[0], nullptr);
+                        linear(ds_fc1, ds_norm, w_mlp_0[0]->permute({1, 0}), 1.0, 0.0, nullptr, b_mlp_0[0]);
 
                         auto ds_gelu = Tensor::buffer(dt_logits, {num_groups, hidden_size_merged}, rsrc.memory_pool);
+                        printf("[DEBUG] Deepstack merger %zu: applying GELU activation\n", deepstack_idx);
                         getInferenceContext().gelu(ds_gelu, ds_fc1);
 
                         auto ds_out = Tensor::buffer(dt_logits, {num_groups, d}, rsrc.memory_pool);
-                        linear(ds_out, ds_gelu, w_mlp_2[0], 1.0, 0.0, b_mlp_2[0], nullptr);
-
+                        linear(ds_out, ds_gelu, w_mlp_2[0]->permute({1, 0}), 1.0, 0.0, nullptr, b_mlp_2[0]);
                         deepstack_features.push_back(ds_out);
                     }
                 }
@@ -351,8 +369,6 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
         // ViT 输出设为 visual_embeds，供后续 Merger
         visual_embeds = vit_hidden_in;
     }
-
-    // printf("here3\n");
 
     // Attention
     // attention inner
@@ -374,9 +390,8 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
     auto attn_val_buf = Tensor::buffer(dt_logits, {nkvh, ngroup * max_seq_len, dh}, rsrc.memory_pool);
     auto attn_val_gemm = attn_val_buf->view({nkvh, ngroup, max_seq_len, dh});
 
-    // printf("here4\n");
-
     // ==== Vision Merger & Deepstack ====
+    printf("[DEBUG] Starting Vision Merger processing: deepstack_features.size()=%zu\n", deepstack_features.size());
     if (has_vision && visual_embeds && num_patches > 0) {
         const uint32_t spatial_merge_size = 2;
         const uint32_t merge_unit = spatial_merge_size * spatial_merge_size; // 4
@@ -392,18 +407,20 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
             // 主Merger (use_postshuffle_norm=False): ln_q(x).view(-1, self.hidden_size)
             auto merger_norm_input = merger_in->view({num_groups * merge_unit, vision_hidden_size});
             auto merger_norm_output = Tensor::buffer(dt_logits, {num_groups * merge_unit, vision_hidden_size}, rsrc.memory_pool);
-            layernorm(merger_norm_output, merger_norm_input, weight->w_v_merger_ln_q[0], weight->b_v_merger_ln_q[0], meta->epsilon);
+            // layernorm(merger_norm_output, merger_norm_input, weight->w_v_merger_ln_q[0], weight->b_v_merger_ln_q[0], meta->epsilon);
+            rmsnorm(merger_norm_output, merger_norm_input, weight->w_v_merger_ln_q[0], meta->epsilon);
             auto merger_norm = merger_norm_output->view({num_groups, hidden_size_merged});
 
             // MLP: fc1 -> GELU -> fc2
             auto merger_fc1 = Tensor::buffer(dt_logits, {num_groups, hidden_size_merged}, rsrc.memory_pool);
-            linear(merger_fc1, merger_norm, weight->w_v_merger_mlp_0[0], 1.0, 0.0, weight->b_v_merger_mlp_0[0], nullptr);
+            linear(merger_fc1, merger_norm, weight->w_v_merger_mlp_0[0]->permute({1, 0}), 1.0, 0.0, nullptr, weight->b_v_merger_mlp_0[0]);
 
             auto merger_gelu = Tensor::buffer(dt_logits, {num_groups, hidden_size_merged}, rsrc.memory_pool);
+            printf("[DEBUG] Main merger: applying GELU activation\n");
             getInferenceContext().gelu(merger_gelu, merger_fc1);
 
             auto merger_out = Tensor::buffer(dt_logits, {num_groups, d}, rsrc.memory_pool);
-            linear(merger_out, merger_gelu, weight->w_v_merger_mlp_2[0], 1.0, 0.0, weight->b_v_merger_mlp_2[0], nullptr);
+            linear(merger_out, merger_gelu, weight->w_v_merger_mlp_2[0]->permute({1, 0}), 1.0, 0.0, nullptr, weight->b_v_merger_mlp_2[0]);
 
             // 按照vLLM方式连接特征: [main_features] + deepstack_features (在特征维度连接)
             if (!deepstack_features.empty()) {
@@ -434,7 +451,6 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
     }
 
     // 在 Merger & Deepstack 之后，构建 logits_in：文本token查表，视觉token用 visual_embeds 顺序替代
-    // printf("here4\n");
     size_t vis_idx = 0;
     for (uint32_t i = 0; i < ntok; i++) {
         const bool is_image_tok = (meta->image_token_id != 0 && tokens[i] == meta->image_token_id);
@@ -464,7 +480,9 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
     }
 
     // Compute llm
+    printf("[DEBUG] Starting LLM processing: %zu layers\n", (size_t)nlayer);
     for (uint32_t layer = 0; layer < nlayer; layer++) {
+        printf("[DEBUG] LLM processing layer %u/%zu\n", layer + 1, (size_t)nlayer);
         // 1. Attention
         // rms norm
         rmsnorm(logits_out, logits_in, weight->w_attn_norm[layer], meta->epsilon);
@@ -492,8 +510,6 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
             mrope_3d(q_buf->view({nh, ntok, dh}), q_buf->view({nh, ntok, dh}), llm_pos_ids_buf, weight->sin_table, weight->cos_table, rope_section_buf);
             mrope_3d(k_buf->view({nkvh, ntok, dh}), k_buf->view({nkvh, ntok, dh}), llm_pos_ids_buf, weight->sin_table, weight->cos_table, rope_section_buf);
         }
-
-        // printf("here5.1\n");
 
         size_t token_offset = 0;
         for (uint32_t req = 0; req < nreq; req++) {
@@ -525,8 +541,6 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
             token_offset += seq_len;
         }
 
-        // printf("here5.2\n");
-
         // o_proj
         linear(logits_in, o_buf, weight->w_attn_out[layer],
                1.0, 0.0, idev == 0 ? logits_in : nullptr, nullptr); // only rank 0 adds residual
@@ -538,8 +552,6 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
             RUN_INFINI(infinirtStreamSynchronize(stream));
         }
 
-        // printf("here5.3\n");
-
         // 2. FFN
         rmsnorm(logits_out, logits_in, weight->w_ffn_norm[layer], meta->epsilon);
         linear(gate_buf, logits_out,
@@ -548,6 +560,7 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
         linear(up_buf, logits_out,
                weight->w_ffn_up[layer],
                1.0, 0.0, nullptr, nullptr);
+        printf("[DEBUG] LLM layer %u: applying SwiGLU activation (SiLU-based)\n", layer);
         swiglu(gate_buf, up_buf, gate_buf);
         linear(logits_in, gate_buf,
                weight->w_ffn_down[layer],
@@ -560,8 +573,6 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
             RUN_INFINI(infinirtStreamSynchronize(stream));
         }
     }
-
-    // printf("here6\n");
 
     // Sample and Output
     if (idev == 0) {
@@ -603,7 +614,7 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
         }
     }
 
-    // printf("here7\n");
+    printf("[DEBUG] Qwen3VL inferDeviceBatch COMPLETED successfully\n");
 }
 
 __C void

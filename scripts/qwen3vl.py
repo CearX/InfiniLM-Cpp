@@ -242,6 +242,7 @@ class Qwen3VLBatchedTask:
         # 统一：ntok 始终为文本 token 数；pixel_values 仅在 prefill(首轮，pos==0) 且有图像时提供
         self.ntok = len(flat_tokens)
         self.pixel_values = None
+        self.num_patches = 0
         self.patch_dim = 0
         self.grid_thw = None
         self.image_path = image_path
@@ -270,20 +271,30 @@ class Qwen3VLBatchedTask:
             return tid == 151656
 
         for task in tasks:
-            if task.pos == 0 and any(is_image_tok(token) or is_video_tok(token) for token in task.tokens):
+            print(f"[DEBUG] Task pos={task.pos}, tokens={task.tokens}")
+            has_image_token = any(is_image_tok(token) or is_video_tok(token) for token in task.tokens)
+            print(f"[DEBUG] Has image/video token: {has_image_token}")
+            if task.pos == 0 and has_image_token:
                 any_prefill_with_image = True
                 break
+        print(f"[DEBUG] any_prefill_with_image: {any_prefill_with_image}")
+        print(f"[DEBUG] image_path: {self.image_path}")
         if any_prefill_with_image:
             try:
-                # 优先使用image_path，否则尝试video_path（暂复用图像预处理以打通管道）
                 src_path = self.image_path if self.image_path is not None else self.video_path
                 if src_path is None:
                     raise RuntimeError("no image/video path provided for prefill with vision input")
+                print(f"[DEBUG] Processing image: {src_path}")
                 self.pixel_values, self.grid_thw = preprocess_image_qwen3vl(src_path)
+                self.num_patches = self.pixel_values.shape[0]  # 设置 patch 数量
                 self.patch_dim = self.pixel_values.shape[1]
+                print(f"[DEBUG] Pixel values shape: {self.pixel_values.shape}")
+                print(f"[DEBUG] Grid THW: {self.grid_thw}")
+                print(f"[DEBUG] Number of patches: {self.num_patches}")
             except Exception as _e:
                 self.pixel_values = None
                 self.grid_thw = None
+                self.num_patches = 0
                 self.patch_dim = 0
 
         # 实现 2D MRoPE pos_ids 计算
@@ -499,6 +510,10 @@ class Qwen3VLForCausalLM:
         return list(output)
 
     def generate(self, input_content, max_steps, topp_=1.0, topk_=1, temperature_=1.0, image_path=None, video_path=None):
+        # 如果有图片，需要在内容中添加图片占位符
+        if image_path is not None:
+            input_content = f"<|vision_start|><|image_pad|><|vision_end|>{input_content}"
+
         input_content = self.tokenizer.apply_chat_template(
             conversation=[{"role": "user", "content": input_content}],
             add_generation_prompt=True,
@@ -506,6 +521,7 @@ class Qwen3VLForCausalLM:
         )
         print(input_content, end="", flush=True)
         tokens = self.tokenizer.encode(input_content)
+        print(f"[DEBUG] Generated tokens: {tokens}")
         infer_task = InferTask(
             0,
             tokens,

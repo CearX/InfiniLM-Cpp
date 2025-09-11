@@ -173,6 +173,11 @@ Qwen3VLWeights::Qwen3VLWeights(
     this->register_weight(W_NAME, W_VAR, i, infinicore::weights::DistributionType::W_DIST_TYPE); \
     weight->W_VAR.push_back(W_VAR);
 
+#define REGISTER_LAYER_WEIGHT_5D(W_NAME, W_VAR, W_DIM_1, W_DIM_2, W_DIM_3, W_DIM_4, W_DIM_5, W_DTYPE, W_DIST_TYPE) \
+    auto W_VAR = Tensor::weight(nullptr, W_DTYPE, {W_DIM_1, W_DIM_2, W_DIM_3, W_DIM_4, W_DIM_5});                  \
+    this->register_weight(W_NAME, W_VAR, i, infinicore::weights::DistributionType::W_DIST_TYPE);                   \
+    weight->W_VAR.push_back(W_VAR);
+
 // merger 权重
 #define REGISTER_MERGER()                                                                                                                        \
     REGISTER_LAYER_WEIGHT_1D("visual.merger.ln_q.bias", b_v_merger_ln_q, vision_hidden_size, dt_norm_w, FULL);                                   \
@@ -196,7 +201,7 @@ Qwen3VLWeights::Qwen3VLWeights(
         //   Loading visual.patch_embed.proj.weight: torch.Size([768, 3, 2, 16, 16])
         //   Loading visual.pos_embed.weight: torch.Size([2304, 768])
         REGISTER_LAYER_WEIGHT_1D("visual.patch_embed.proj.bias", b_v_patch_embed_proj, vision_hidden_size, dt_logits, FULL);
-        REGISTER_LAYER_WEIGHT_2D("visual.patch_embed.proj.weight", w_v_patch_embed_proj, vision_hidden_size, 3 * 2 * patch_size * patch_size, dt_logits, COLUMN);
+        REGISTER_LAYER_WEIGHT_5D("visual.patch_embed.proj.weight", w_v_patch_embed_proj, vision_hidden_size, 3, 2, patch_size, patch_size, dt_logits, FULL);
         REGISTER_LAYER_WEIGHT_2D("visual.pos_embed.weight", w_v_pos_embed, 3 * vision_hidden_size, vision_hidden_size, dt_logits, COLUMN);
 
         // merger 和 merger_list 权重
@@ -246,16 +251,16 @@ Qwen3VLWeights::Qwen3VLWeights(
                 REGISTER_LAYER_WEIGHT_1D("visual.blocks." + std::to_string(layer) + ".norm1.bias", b_v_norm1, vision_hidden_size, dt_norm_w, FULL);
                 REGISTER_LAYER_WEIGHT_1D("visual.blocks." + std::to_string(layer) + ".norm1.weight", w_v_norm1, vision_hidden_size, dt_norm_w, FULL);
                 REGISTER_LAYER_WEIGHT_1D("visual.blocks." + std::to_string(layer) + ".attn.proj.bias", b_v_attn_proj, vision_hidden_size, dt_logits, FULL);
-                REGISTER_LAYER_WEIGHT_2D("visual.blocks." + std::to_string(layer) + ".attn.proj.weight", w_v_attn_proj, vision_hidden_size, vision_hidden_size, dt_logits, COLUMN);
+                REGISTER_LAYER_WEIGHT_2D("visual.blocks." + std::to_string(layer) + ".attn.proj.weight", w_v_attn_proj, vision_hidden_size, vision_hidden_size, dt_logits, ROW);
                 REGISTER_LAYER_WEIGHT_1D("visual.blocks." + std::to_string(layer) + ".attn.qkv.bias", b_v_attn_qkv, 3 * vision_hidden_size, dt_logits, COLUMN);
-                REGISTER_LAYER_WEIGHT_2D("visual.blocks." + std::to_string(layer) + ".attn.qkv.weight", w_v_attn_qkv, 3 * vision_hidden_size, vision_hidden_size, dt_logits, COLUMN);
+                REGISTER_LAYER_WEIGHT_2D("visual.blocks." + std::to_string(layer) + ".attn.qkv.weight", w_v_attn_qkv, vision_hidden_size, 3 * vision_hidden_size, dt_logits, ROW);
 
                 REGISTER_LAYER_WEIGHT_1D("visual.blocks." + std::to_string(layer) + ".norm2.bias", b_v_norm2, vision_hidden_size, dt_norm_w, FULL);
                 REGISTER_LAYER_WEIGHT_1D("visual.blocks." + std::to_string(layer) + ".norm2.weight", w_v_norm2, vision_hidden_size, dt_norm_w, FULL);
                 REGISTER_LAYER_WEIGHT_1D("visual.blocks." + std::to_string(layer) + ".mlp.linear_fc1.bias", b_v_mlp_fc1, 4 * vision_hidden_size, dt_logits, COLUMN);
-                REGISTER_LAYER_WEIGHT_2D("visual.blocks." + std::to_string(layer) + ".mlp.linear_fc1.weight", w_v_mlp_fc1, 4 * vision_hidden_size, vision_hidden_size, dt_logits, COLUMN);
+                REGISTER_LAYER_WEIGHT_2D("visual.blocks." + std::to_string(layer) + ".mlp.linear_fc1.weight", w_v_mlp_fc1, vision_hidden_size, 4 * vision_hidden_size, dt_logits, ROW);
                 REGISTER_LAYER_WEIGHT_1D("visual.blocks." + std::to_string(layer) + ".mlp.linear_fc2.bias", b_v_mlp_fc2, vision_hidden_size, dt_logits, COLUMN);
-                REGISTER_LAYER_WEIGHT_2D("visual.blocks." + std::to_string(layer) + ".mlp.linear_fc2.weight", w_v_mlp_fc2, vision_hidden_size, 4 * vision_hidden_size, dt_logits, COLUMN);
+                REGISTER_LAYER_WEIGHT_2D("visual.blocks." + std::to_string(layer) + ".mlp.linear_fc2.weight", w_v_mlp_fc2, 4 * vision_hidden_size, vision_hidden_size, dt_logits, ROW);
             }
 
             // llm
