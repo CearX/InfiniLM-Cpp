@@ -155,8 +155,8 @@ Qwen3VLWeights::Qwen3VLWeights(
         this->register_weight("lm_head.weight", w_out_embd, i);
         weight->w_out_embd = w_out_embd;
 
-        weight->sin_table = getSinTable(dctx, dh, meta->theta, dt_logits);
-        weight->cos_table = getCosTable(dctx, dh, meta->theta, dt_logits);
+        weight->sin_table = getSinTable_llm(dctx, dh, meta->theta, dt_logits);
+        weight->cos_table = getCosTable_llm(dctx, dh, meta->theta, dt_logits);
 
         // 视觉 mRoPE 表（2D）：按 vision head 维度构建
         size_t dh_v = vision_heads > 0 ? (vision_hidden_size / vision_heads) : vision_hidden_size;

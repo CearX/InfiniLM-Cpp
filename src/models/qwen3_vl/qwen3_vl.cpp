@@ -4,6 +4,7 @@
 #include "../../utils.hpp"
 #include "../inference_context.hpp"
 
+#include <cmath>
 #include <random>
 #include <thread>
 #include <vector>
@@ -57,8 +58,8 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
                       const float *temperature, const uint32_t *topk, const float *topp,
                       uint32_t *output, void *last_logits) {
     // DEBUG: 推理开始
-    printf("[DEBUG] Qwen3VL inferDeviceBatch START: idev=%u, ntok=%u, nreq=%u, has_vision=%s\n",
-           idev, ntok, nreq, (pixel_values != nullptr) ? "true" : "false");
+    // printf("[DEBUG] Qwen3VL inferDeviceBatch START: idev=%u, ntok=%u, nreq=%u, has_vision=%s\n",
+    //    idev, ntok, nreq, (pixel_values != nullptr) ? "true" : "false");
     auto nlayer = meta->nlayer;
     auto nkvh = meta->nkvh / ndev;
     auto nh = meta->nh / ndev;
@@ -73,17 +74,31 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
     auto weight = rsrc.weights;
     bool has_qkv_bias = meta->has_qkv_bias;
 
+    // 判断是否为prefill阶段（有vision且是第一次前向）
+    bool has_vision = (pixel_values != nullptr);
+    bool is_prefill = has_vision && (req_pos[0] == 0);
+
+    // 计算实际patches数量
+    uint32_t num_patches = 0;
+    if (pos_ids != nullptr && pos_ids_len > 0) {
+        num_patches = pos_ids_len / 2;
+    }
+
+    uint32_t llm_ntok = is_prefill ? (ntok - 1 + num_patches) : ntok; // prefill: 14 - 1 image token + 600 patches = 613
+    // printf("[DEBUG] is_prefill=%s, ntok=%u, llm_ntok=%u, num_patches=%u\n",
+    //    is_prefill ? "true" : "false", ntok, llm_ntok, num_patches);
+
     // Allocate buffers
-    auto logits_in = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool);
-    auto logits_out = Tensor::buffer(dt_logits, {ntok, d}, rsrc.memory_pool);
-    auto q_buf = Tensor::buffer(dt_logits, {ntok, nh * dh}, rsrc.memory_pool);
-    auto k_buf = Tensor::buffer(dt_logits, {ntok, nkvh * dh}, rsrc.memory_pool);
-    auto v_buf = Tensor::buffer(dt_logits, {ntok, nkvh * dh}, rsrc.memory_pool);
+    auto logits_in = Tensor::buffer(dt_logits, {llm_ntok, d}, rsrc.memory_pool);
+    auto logits_out = Tensor::buffer(dt_logits, {llm_ntok, d}, rsrc.memory_pool);
+    auto q_buf = Tensor::buffer(dt_logits, {llm_ntok, nh * dh}, rsrc.memory_pool);
+    auto k_buf = Tensor::buffer(dt_logits, {llm_ntok, nkvh * dh}, rsrc.memory_pool);
+    auto v_buf = Tensor::buffer(dt_logits, {llm_ntok, nkvh * dh}, rsrc.memory_pool);
 
-    auto gate_buf = Tensor::buffer(dt_logits, {ntok, di}, rsrc.memory_pool);
-    auto up_buf = Tensor::buffer(dt_logits, {ntok, di}, rsrc.memory_pool);
+    auto gate_buf = Tensor::buffer(dt_logits, {llm_ntok, di}, rsrc.memory_pool);
+    auto up_buf = Tensor::buffer(dt_logits, {llm_ntok, di}, rsrc.memory_pool);
 
-    auto o_buf = Tensor::buffer(dt_logits, {ntok, nh * dh}, rsrc.memory_pool);
+    auto o_buf = Tensor::buffer(dt_logits, {llm_ntok, nh * dh}, rsrc.memory_pool);
     auto prob_buf = Tensor::buffer(dt_logits, {nreq, dvoc}, rsrc.memory_pool);
     auto result_buf = Tensor::buffer(INFINI_DTYPE_I64, {nreq}, rsrc.memory_pool);
     auto result_cpu = std::vector<int64_t>(nreq);
@@ -104,16 +119,13 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
     std::shared_ptr<Tensor> vision_pos_ids_buf; // for ViT [patches, 2]
     std::shared_ptr<Tensor> llm_pos_ids_buf;    // for LLM [patches+text_len, 3] - TODO: wire from API
     std::shared_ptr<Tensor> rope_section_buf;   // rope_section [3,] - TODO: wire from API
-    uint32_t num_patches = 0;
-
-    // Vision pos_ids: 严格验证 [patches, 2] 格式 (h, w)
     if (pos_ids != nullptr && pos_ids_len > 0) {
+        // Vision pos_ids: 严格验证 [patches, 2] 格式 (h, w)
         if (pos_ids_len % 2 != 0) {
             // 错误：pos_ids长度必须是偶数，表示(h,w)对
             printf("Error: pos_ids_len (%u) must be even for 2D mRoPE [patches, 2] format\n", pos_ids_len);
             return; // 或者抛出异常
         }
-        num_patches = pos_ids_len / 2;
         if (num_patches == 0) {
             printf("Error: num_patches cannot be zero for 2D mRoPE\n");
             return;
@@ -165,9 +177,8 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
     std::vector<uint32_t> deepstack_layers = {3, 6, 9};
     std::vector<std::shared_ptr<Tensor>> deepstack_features;
 
-    const bool has_vision = (pixel_values != nullptr) && (num_patches > 0);
-    printf("[DEBUG] Vision processing: has_vision=%s, num_patches=%u\n",
-           has_vision ? "true" : "false", num_patches);
+    // printf("[DEBUG] Vision processing: has_vision=%s, num_patches=%u\n",
+    //        has_vision ? "true" : "false", num_patches);
     if (has_vision) {
         // 根据权重形状确定实际参数: [vision_hidden_size, 3, temporal, patch, patch]
         uint32_t in_channels = 3;
@@ -237,8 +248,8 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
         uint32_t vision_heads = static_cast<uint32_t>(meta->vision_heads);
         uint32_t dh_v = vision_heads > 0 ? (vision_hidden_size / vision_heads) : vision_hidden_size;
 
-        printf("[DEBUG] ViT configuration: layers=%u, heads=%u, hidden_size=%u, dh_v=%u\n",
-               vision_layers, vision_heads, vision_hidden_size, dh_v);
+        // printf("[DEBUG] ViT configuration: layers=%u, heads=%u, hidden_size=%u, dh_v=%u\n",
+        //        vision_layers, vision_heads, vision_hidden_size, dh_v);
 
         // Deepstack特征提取在指定层进行
 
@@ -256,9 +267,9 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
         auto attn_val_v = Tensor::buffer(dt_logits, {vision_heads, num_patches, dh_v}, rsrc.memory_pool);
 
         for (uint32_t vlayer = 0; vlayer < vision_layers; ++vlayer) {
-            printf("[DEBUG] ViT processing layer %u/%u\n", vlayer + 1, vision_layers);
+            // printf("[DEBUG] ViT processing layer %u/%u\n", vlayer + 1, vision_layers);
             // 使用rmsnorm代替layernorm（暂时跳过bias）
-            printf("[DEBUG] Using rmsnorm instead of layernorm...\n");
+            // printf("[DEBUG] Using rmsnorm instead of layernorm...\n");
             rmsnorm(vit_hidden_out, vit_hidden_in, weight->w_v_norm1[vlayer], meta->epsilon);
             // QKV
             linear(vit_qkv, vit_hidden_out, weight->w_v_attn_qkv[vlayer], 1.0, 0.0, nullptr, weight->b_v_attn_qkv[vlayer]);
@@ -305,7 +316,7 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
             auto vit_fc1 = Tensor::buffer(dt_logits, {num_patches, 4u * vision_hidden_size}, rsrc.memory_pool);
             linear(vit_fc1, vit_hidden_out, weight->w_v_mlp_fc1[vlayer], 1.0, 0.0, nullptr, weight->b_v_mlp_fc1[vlayer]);
             auto vit_gelu = Tensor::buffer(dt_logits, {num_patches, 4u * vision_hidden_size}, rsrc.memory_pool);
-            printf("[DEBUG] ViT layer %u: applying GELU activation (should be gelu_pytorch_tanh)\n", vlayer);
+            // printf("[DEBUG] ViT layer %u: applying GELU activation (should be gelu_pytorch_tanh)\n", vlayer);
             getInferenceContext().gelu(vit_gelu, vit_fc1);
             auto vit_fc2 = Tensor::buffer(dt_logits, {num_patches, vision_hidden_size}, rsrc.memory_pool);
             linear(vit_fc2, vit_gelu, weight->w_v_mlp_fc2[vlayer], 1.0, 0.0, nullptr, weight->b_v_mlp_fc2[vlayer]);
@@ -316,15 +327,15 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
             if (std::find(deepstack_layers.begin(), deepstack_layers.end(), vlayer) != deepstack_layers.end()) {
                 // 提取deepstack特征：使用对应的deepstack merger
                 size_t deepstack_idx = std::find(deepstack_layers.begin(), deepstack_layers.end(), vlayer) - deepstack_layers.begin();
-                printf("[DEBUG] Deepstack feature extraction at layer %u (deepstack_idx=%zu)\n", vlayer, deepstack_idx);
+                // printf("[DEBUG] Deepstack feature extraction at layer %u (deepstack_idx=%zu)\n", vlayer, deepstack_idx);
 
                 if (deepstack_idx < 3) { // 最多3个deepstack层
                     const auto &w_ln_q = deepstack_idx == 0 ? weight->w_v_merger_list_0_ln_q
                                        : deepstack_idx == 1 ? weight->w_v_merger_list_1_ln_q
                                                             : weight->w_v_merger_list_2_ln_q;
-                    const auto &b_ln_q = deepstack_idx == 0 ? weight->b_v_merger_list_0_ln_q
-                                       : deepstack_idx == 1 ? weight->b_v_merger_list_1_ln_q
-                                                            : weight->b_v_merger_list_2_ln_q;
+                    // const auto &b_ln_q = deepstack_idx == 0 ? weight->b_v_merger_list_0_ln_q
+                    //                    : deepstack_idx == 1 ? weight->b_v_merger_list_1_ln_q
+                    //                                         : weight->b_v_merger_list_2_ln_q;
                     const auto &w_mlp_0 = deepstack_idx == 0 ? weight->w_v_merger_list_0_mlp_0
                                         : deepstack_idx == 1 ? weight->w_v_merger_list_1_mlp_0
                                                              : weight->w_v_merger_list_2_mlp_0;
@@ -349,13 +360,12 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
                         auto ds_norm = Tensor::buffer(dt_logits, {num_groups, hidden_size_merged}, rsrc.memory_pool);
                         // layernorm(ds_norm, ds_input, w_ln_q[0], b_ln_q[0], meta->epsilon);
                         rmsnorm(ds_norm, ds_input, w_ln_q[0], meta->epsilon);
-                        printf("b_ln_q[0] size: %zu\n", b_ln_q[0]->shape()[0]);
 
                         auto ds_fc1 = Tensor::buffer(dt_logits, {num_groups, hidden_size_merged}, rsrc.memory_pool);
                         linear(ds_fc1, ds_norm, w_mlp_0[0]->permute({1, 0}), 1.0, 0.0, nullptr, b_mlp_0[0]);
 
                         auto ds_gelu = Tensor::buffer(dt_logits, {num_groups, hidden_size_merged}, rsrc.memory_pool);
-                        printf("[DEBUG] Deepstack merger %zu: applying GELU activation\n", deepstack_idx);
+                        // printf("[DEBUG] Deepstack merger %zu: applying GELU activation\n", deepstack_idx);
                         getInferenceContext().gelu(ds_gelu, ds_fc1);
 
                         auto ds_out = Tensor::buffer(dt_logits, {num_groups, d}, rsrc.memory_pool);
@@ -391,7 +401,7 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
     auto attn_val_gemm = attn_val_buf->view({nkvh, ngroup, max_seq_len, dh});
 
     // ==== Vision Merger & Deepstack ====
-    printf("[DEBUG] Starting Vision Merger processing: deepstack_features.size()=%zu\n", deepstack_features.size());
+    // printf("[DEBUG] Starting Vision Merger processing: deepstack_features.size()=%zu\n", deepstack_features.size());
     if (has_vision && visual_embeds && num_patches > 0) {
         const uint32_t spatial_merge_size = 2;
         const uint32_t merge_unit = spatial_merge_size * spatial_merge_size; // 4
@@ -416,7 +426,7 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
             linear(merger_fc1, merger_norm, weight->w_v_merger_mlp_0[0]->permute({1, 0}), 1.0, 0.0, nullptr, weight->b_v_merger_mlp_0[0]);
 
             auto merger_gelu = Tensor::buffer(dt_logits, {num_groups, hidden_size_merged}, rsrc.memory_pool);
-            printf("[DEBUG] Main merger: applying GELU activation\n");
+            // printf("[DEBUG] Main merger: applying GELU activation\n");
             getInferenceContext().gelu(merger_gelu, merger_fc1);
 
             auto merger_out = Tensor::buffer(dt_logits, {num_groups, d}, rsrc.memory_pool);
@@ -451,27 +461,35 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
     }
 
     // 在 Merger & Deepstack 之后，构建 logits_in：文本token查表，视觉token用 visual_embeds 顺序替代
-    size_t vis_idx = 0;
-    for (uint32_t i = 0; i < ntok; i++) {
-        const bool is_image_tok = (meta->image_token_id != 0 && tokens[i] == meta->image_token_id);
-        const bool is_video_tok = (meta->video_token_id != 0 && tokens[i] == meta->video_token_id);
-        if (has_vision && (is_image_tok || is_video_tok) && visual_embeds) {
-            if (vis_idx < num_patches) {
-                uint32_t copy_dim = std::min<uint32_t>(d, static_cast<uint32_t>(visual_embeds->shape()[1]));
-                if (copy_dim > 0) {
-                    RUN_INFINI(infinirtMemcpyAsync(
-                        logits_in->data(i * d),
-                        visual_embeds->data(vis_idx * visual_embeds->shape()[1]),
-                        dsize(dt_logits) * copy_dim, INFINIRT_MEMCPY_D2D, stream));
+    if (is_prefill) {
+        // Prefill阶段：展开vision token
+        size_t vis_idx = 0;
+        uint32_t out_idx = 0;
+        for (uint32_t i = 0; i < ntok; i++) {
+            const bool is_image_tok = (meta->image_token_id != 0 && tokens[i] == meta->image_token_id);
+            const bool is_video_tok = (meta->video_token_id != 0 && tokens[i] == meta->video_token_id);
+            if (has_vision && (is_image_tok || is_video_tok) && visual_embeds) {
+                // 将一个vision token展开为num_patches个patch
+                for (size_t patch_idx = 0; patch_idx < num_patches && vis_idx < num_patches; patch_idx++, vis_idx++, out_idx++) {
+                    uint32_t copy_dim = std::min<uint32_t>(d, static_cast<uint32_t>(visual_embeds->shape()[1]));
+                    if (copy_dim > 0) {
+                        RUN_INFINI(infinirtMemcpyAsync(
+                            logits_in->data(out_idx * d),
+                            visual_embeds->data(vis_idx * visual_embeds->shape()[1]),
+                            dsize(dt_logits) * copy_dim, INFINIRT_MEMCPY_D2D, stream));
+                    }
                 }
-                vis_idx++;
             } else {
                 RUN_INFINI(infinirtMemcpyAsync(
-                    logits_in->data(i * d),
+                    logits_in->data(out_idx * d),
                     weight->w_in_embd->data(tokens[i] * d),
                     dsize(dt_logits) * d, INFINIRT_MEMCPY_D2D, stream));
+                out_idx++;
             }
-        } else {
+        }
+    } else {
+        // Decode阶段：直接使用text token
+        for (uint32_t i = 0; i < ntok; i++) {
             RUN_INFINI(infinirtMemcpyAsync(
                 logits_in->data(i * d),
                 weight->w_in_embd->data(tokens[i] * d),
@@ -480,9 +498,9 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
     }
 
     // Compute llm
-    printf("[DEBUG] Starting LLM processing: %zu layers\n", (size_t)nlayer);
+    // printf("[DEBUG] Starting LLM processing: %zu layers\n", (size_t)nlayer);
     for (uint32_t layer = 0; layer < nlayer; layer++) {
-        printf("[DEBUG] LLM processing layer %u/%zu\n", layer + 1, (size_t)nlayer);
+        // printf("[DEBUG] LLM processing layer %u/%zu\n", layer + 1, (size_t)nlayer);
         // 1. Attention
         // rms norm
         rmsnorm(logits_out, logits_in, weight->w_attn_norm[layer], meta->epsilon);
@@ -495,8 +513,8 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
                1.0, 0.0, nullptr, has_qkv_bias ? weight->b_attn_k[layer] : nullptr);
         // q/k-norm（实际是 RMSNorm，按 vLLM 实现）
         if (weight->w_q_norm.size() > layer && weight->w_k_norm.size() > layer) {
-            auto q_norm_buf = Tensor::buffer(dt_logits, {ntok, nh * dh}, rsrc.memory_pool);
-            auto k_norm_buf = Tensor::buffer(dt_logits, {ntok, nkvh * dh}, rsrc.memory_pool);
+            auto q_norm_buf = Tensor::buffer(dt_logits, {llm_ntok, nh * dh}, rsrc.memory_pool);
+            auto k_norm_buf = Tensor::buffer(dt_logits, {llm_ntok, nkvh * dh}, rsrc.memory_pool);
             rmsnorm(q_norm_buf, q_buf, weight->w_q_norm[layer], meta->epsilon);
             rmsnorm(k_norm_buf, k_buf, weight->w_k_norm[layer], meta->epsilon);
             rearrange(q_buf, q_norm_buf);
@@ -505,10 +523,53 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
         linear(v_buf, logits_out,
                weight->w_attn_v[layer],
                1.0, 0.0, nullptr, has_qkv_bias ? weight->b_attn_v[layer] : nullptr);
-        // 3d mrope, pos_ids形状为[patches+text_len, 3]
-        if (llm_pos_ids_buf && rope_section_buf) {
-            mrope_3d(q_buf->view({nh, ntok, dh}), q_buf->view({nh, ntok, dh}), llm_pos_ids_buf, weight->sin_table, weight->cos_table, rope_section_buf);
-            mrope_3d(k_buf->view({nkvh, ntok, dh}), k_buf->view({nkvh, ntok, dh}), llm_pos_ids_buf, weight->sin_table, weight->cos_table, rope_section_buf);
+        // RoPE处理：prefill阶段使用3D MRoPE，decode阶段使用普通RoPE
+        if (is_prefill && llm_pos_ids_buf && rope_section_buf) {
+            // Prefill阶段：3D MRoPE
+            // printf("[DEBUG] MRoPE3D参数检查:\n");
+            auto q_view = q_buf->view({nh, llm_ntok, dh});
+            auto k_view = k_buf->view({nkvh, llm_ntok, dh});
+            // printf("[DEBUG] q维度: [%zu, %zu, %zu] (nhead=%zu, llm_seqlen=%u, dhead=%zu)\n",
+            //        q_view->shape()[0], q_view->shape()[1], q_view->shape()[2], nh, llm_ntok, dh);
+            // printf("[DEBUG] k维度: [%zu, %zu, %zu] (nkvh=%zu, llm_seqlen=%u, dhead=%zu)\n",
+            //        k_view->shape()[0], k_view->shape()[1], k_view->shape()[2], nkvh, llm_ntok, dh);
+            // printf("[DEBUG] pos维度: [%zu, %zu]\n", llm_pos_ids_buf->shape()[0], llm_pos_ids_buf->shape()[1]);
+            // printf("[DEBUG] sin维度: [%zu, %zu]\n", weight->sin_table->shape()[0], weight->sin_table->shape()[1]);
+            // printf("[DEBUG] cos维度: [%zu, %zu]\n", weight->cos_table->shape()[0], weight->cos_table->shape()[1]);
+            // printf("[DEBUG] rope_section维度: [%zu]\n", rope_section_buf->shape()[0]);
+
+            mrope_3d(q_view, q_view, llm_pos_ids_buf, weight->sin_table, weight->cos_table, rope_section_buf);
+            mrope_3d(k_view, k_view, llm_pos_ids_buf, weight->sin_table, weight->cos_table, rope_section_buf);
+        } else if (!is_prefill) {
+            // Decode阶段：普通RoPE，使用当前位置
+            // printf("[DEBUG] 使用普通RoPE for decode阶段\n");
+            auto pos_buf = Tensor::buffer(INFINI_DTYPE_U32, {llm_ntok}, rsrc.memory_pool);
+            // decode时位置来自req_pos + current_step
+            uint32_t current_pos = req_pos[0] + req_lens[0] - 1; // 当前生成位置
+            uint32_t pos_data = current_pos;
+            RUN_INFINI(infinirtMemcpyAsync(pos_buf->data(), &pos_data, sizeof(uint32_t), INFINIRT_MEMCPY_H2D, stream));
+
+            // 添加decode阶段RoPE调试信息
+            // printf("[DEBUG] Decode RoPE 参数调试:\n");
+            // printf("[DEBUG] req_pos[0]=%u, req_lens[0]=%u, current_pos=%u\n", req_pos[0], req_lens[0], current_pos);
+            // printf("[DEBUG] nh=%zu, nkvh=%zu, llm_ntok=%u, dh=%zu\n", nh, nkvh, llm_ntok, dh);
+
+            auto q_view = q_buf->view({llm_ntok, nh, dh});
+            auto k_view = k_buf->view({llm_ntok, nkvh, dh});
+            // printf("[DEBUG] q_view维度: [%zu, %zu, %zu]\n", q_view->shape()[0], q_view->shape()[1], q_view->shape()[2]);
+            // printf("[DEBUG] k_view维度: [%zu, %zu, %zu]\n", k_view->shape()[0], k_view->shape()[1], k_view->shape()[2]);
+            // printf("[DEBUG] pos_buf维度: [%zu]\n", pos_buf->shape()[0]);
+            // printf("[DEBUG] sin_table维度: [%zu, %zu]\n", weight->sin_table->shape()[0], weight->sin_table->shape()[1]);
+            // printf("[DEBUG] cos_table维度: [%zu, %zu]\n", weight->cos_table->shape()[0], weight->cos_table->shape()[1]);
+
+            // // RoPE维度一致性检查
+            // printf("[DEBUG] RoPE维度检查:\n");
+            // printf("[DEBUG] seqlen(llm_ntok)=%u, nhead(nh)=%zu, dhead(dh)=%zu\n", llm_ntok, nh, dh);
+            // printf("[DEBUG] table_len(sin[0])=%zu, table_dim(sin[1])=%zu\n", weight->sin_table->shape()[0], weight->sin_table->shape()[1]);
+            // printf("[DEBUG] pos_seqlen=%zu\n", pos_buf->shape()[0]);
+
+            rope(q_view, q_view, pos_buf, weight->sin_table, weight->cos_table);
+            rope(k_view, k_view, pos_buf, weight->sin_table, weight->cos_table);
         }
 
         size_t token_offset = 0;
@@ -516,6 +577,7 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
             auto past_len = req_pos[req];
             auto seq_len = req_lens[req];
             auto total_len = past_len + seq_len;
+            // printf("[DEBUG] KV Cache - req=%u: past_len=%u, seq_len=%u, total_len=%u\n", req, past_len, seq_len, total_len);
             auto o = o_buf->slice({{0, token_offset, seq_len}})->view({seq_len, nkvh, ngroup, dh})->permute({1, 2, 0, 3});
             auto q = q_buf->slice({{0, token_offset, seq_len}})->view({seq_len, nkvh, ngroup, dh})->permute({1, 2, 0, 3});
             auto k = k_buf->slice({{0, token_offset, seq_len}})->view({seq_len, nkvh, dh});
@@ -547,7 +609,7 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
         // All_reduce if distributed
         if (rsrc.comm != nullptr) {
             RUN_INFINI(infinicclAllReduce(
-                logits_in->data(), logits_in->data(), ntok * d, dt_logits,
+                logits_in->data(), logits_in->data(), llm_ntok * d, dt_logits,
                 INFINICCL_SUM, rsrc.comm, stream));
             RUN_INFINI(infinirtStreamSynchronize(stream));
         }
@@ -560,7 +622,7 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
         linear(up_buf, logits_out,
                weight->w_ffn_up[layer],
                1.0, 0.0, nullptr, nullptr);
-        printf("[DEBUG] LLM layer %u: applying SwiGLU activation (SiLU-based)\n", layer);
+        // printf("[DEBUG] LLM layer %u: applying SwiGLU activation (SiLU-based)\n", layer);
         swiglu(gate_buf, up_buf, gate_buf);
         linear(logits_in, gate_buf,
                weight->w_ffn_down[layer],
@@ -568,7 +630,7 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
         // All_reduce if distributed
         if (rsrc.comm != nullptr) {
             RUN_INFINI(infinicclAllReduce(
-                logits_in->data(), logits_in->data(), ntok * d, dt_logits,
+                logits_in->data(), logits_in->data(), llm_ntok * d, dt_logits,
                 INFINICCL_SUM, rsrc.comm, stream));
             RUN_INFINI(infinirtStreamSynchronize(stream));
         }
@@ -578,10 +640,10 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
     if (idev == 0) {
         if (last_logits != nullptr) {
             rmsnorm(logits_out, logits_in, weight->w_out_norm, meta->epsilon);
-            auto last_logits_buf = Tensor::buffer(dt_logits, {ntok, dvoc}, rsrc.memory_pool);
+            auto last_logits_buf = Tensor::buffer(dt_logits, {llm_ntok, dvoc}, rsrc.memory_pool);
             linear(last_logits_buf, logits_out, weight->w_out_embd, 1.0, 0.0, nullptr, nullptr);
             RUN_INFINI(infinirtStreamSynchronize(stream));
-            RUN_INFINI(infinirtMemcpy(last_logits, last_logits_buf->data(), dsize(dt_logits) * ntok * dvoc, INFINIRT_MEMCPY_D2H));
+            RUN_INFINI(infinirtMemcpy(last_logits, last_logits_buf->data(), dsize(dt_logits) * llm_ntok * dvoc, INFINIRT_MEMCPY_D2H));
         }
         if (output != nullptr) {
             size_t token_offset = 0;
@@ -594,6 +656,32 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
                         meta->epsilon);
             }
             linear(prob_buf, logits_out->slice(0, 0, nreq), weight->w_out_embd, 1.0, 0.0, nullptr, nullptr);
+
+            // 调试：在采样前检查prob_buf是否存在NaN/Inf，并统计范围
+            RUN_INFINI(infinirtStreamSynchronize(stream));
+            auto prob_cpu = std::vector<float>(nreq * dvoc);
+            RUN_INFINI(infinirtMemcpy(prob_cpu.data(), prob_buf->data(), sizeof(float) * nreq * dvoc, INFINIRT_MEMCPY_D2H));
+            size_t nan_count = 0, inf_count = 0;
+            float global_min = std::numeric_limits<float>::infinity();
+            float global_max = -std::numeric_limits<float>::infinity();
+            for (size_t i = 0; i < (size_t)nreq * (size_t)dvoc; ++i) {
+                float v = prob_cpu[i];
+                if (!std::isfinite(v)) {
+                    if (std::isnan(v)) {
+                        nan_count++;
+                    } else {
+                        inf_count++;
+                    }
+                } else {
+                    if (v < global_min) {
+                        global_min = v;
+                    }
+                    if (v > global_max) {
+                        global_max = v;
+                    }
+                }
+            }
+            printf("[DEBUG] prob_buf stats: nan=%zu, inf=%zu, min=%g, max=%g\n", nan_count, inf_count, global_min, global_max);
             std::random_device _rd;
             std::mt19937 gen(_rd());
             token_offset = 0;
@@ -614,7 +702,7 @@ void inferDeviceBatch(const Qwen3VLMeta *meta, DeviceResource &rsrc,
         }
     }
 
-    printf("[DEBUG] Qwen3VL inferDeviceBatch COMPLETED successfully\n");
+    // printf("[DEBUG] Qwen3VL inferDeviceBatch COMPLETED successfully\n");
 }
 
 __C void

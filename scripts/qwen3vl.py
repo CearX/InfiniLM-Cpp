@@ -271,26 +271,26 @@ class Qwen3VLBatchedTask:
             return tid == 151656
 
         for task in tasks:
-            print(f"[DEBUG] Task pos={task.pos}, tokens={task.tokens}")
+            # print(f"[DEBUG] Task pos={task.pos}, tokens={task.tokens}")
             has_image_token = any(is_image_tok(token) or is_video_tok(token) for token in task.tokens)
-            print(f"[DEBUG] Has image/video token: {has_image_token}")
+            # print(f"[DEBUG] Has image/video token: {has_image_token}")
             if task.pos == 0 and has_image_token:
                 any_prefill_with_image = True
                 break
-        print(f"[DEBUG] any_prefill_with_image: {any_prefill_with_image}")
-        print(f"[DEBUG] image_path: {self.image_path}")
+        # print(f"[DEBUG] any_prefill_with_image: {any_prefill_with_image}")
+        # print(f"[DEBUG] image_path: {self.image_path}")
         if any_prefill_with_image:
             try:
                 src_path = self.image_path if self.image_path is not None else self.video_path
                 if src_path is None:
                     raise RuntimeError("no image/video path provided for prefill with vision input")
-                print(f"[DEBUG] Processing image: {src_path}")
+                # print(f"[DEBUG] Processing image: {src_path}")
                 self.pixel_values, self.grid_thw = preprocess_image_qwen3vl(src_path)
                 self.num_patches = self.pixel_values.shape[0]  # 设置 patch 数量
                 self.patch_dim = self.pixel_values.shape[1]
-                print(f"[DEBUG] Pixel values shape: {self.pixel_values.shape}")
-                print(f"[DEBUG] Grid THW: {self.grid_thw}")
-                print(f"[DEBUG] Number of patches: {self.num_patches}")
+                # print(f"[DEBUG] Pixel values shape: {self.pixel_values.shape}")
+                # print(f"[DEBUG] Grid THW: {self.grid_thw}")
+                # print(f"[DEBUG] Number of patches: {self.num_patches}")
             except Exception as _e:
                 self.pixel_values = None
                 self.grid_thw = None
@@ -347,26 +347,58 @@ class Qwen3VLBatchedTask:
         self.deepstack_layers_len = len(deepstack_visual_indexes)
 
         if self.has_vision and hasattr(self, 'num_patches') and self.num_patches > 0:
-            # 构造 llm_pos_ids [patches+text_len, 3] 其中 3 表示 (t, h, w)
-            patches_plus_text = self.num_patches + self.ntok
+            # 构造 3D MRoPE pos_ids，考虑token替换：ntok-1+num_patches
+            # 基于Rust代码的逻辑：pre_text + vision + post_text
+
+            # 计算image token的位置（假设只有一个image token）
+            image_token_id = 151655  # <|image_pad|> token
+            image_token_pos = -1
+            for i, token in enumerate(self.tokens):
+                if token == image_token_id:
+                    image_token_pos = i
+                    break
+
+            if image_token_pos == -1:
+                # 如果没找到image token，按原逻辑处理
+                pre_text_len = 0
+                post_text_len = self.ntok
+            else:
+                pre_text_len = image_token_pos  # image token之前的文本
+                post_text_len = self.ntok - image_token_pos - 1  # image token之后的文本
+
+            # print(f"[DEBUG] 3D pos_ids: pre_text_len={pre_text_len}, vision_len={self.num_patches}, post_text_len={post_text_len}")
+
+            total_len = pre_text_len + self.num_patches + post_text_len
             llm_pos_ids_flat = []
 
-            # 为视觉patches构造位置: t=0 (单帧), h和w从原始pos_ids获取
-            for i in range(self.num_patches):
-                t_pos = 0  # 单帧视频，t维度为0
-                h_pos = flat_pos_ids[i * 2] if i * 2 < len(flat_pos_ids) else 0
-                w_pos = flat_pos_ids[i * 2 + 1] if i * 2 + 1 < len(flat_pos_ids) else 0
-                llm_pos_ids_flat.extend([t_pos, h_pos, w_pos])
+            # 图像前文本：每个维度都是连续递增
+            for i in range(pre_text_len):
+                llm_pos_ids_flat.extend([i, i, i])
 
-            # 为文本tokens构造位置: t递增, h=0, w=0
-            for i in range(self.ntok):
-                t_pos = self.num_patches + i  # 时间维度接续视觉tokens
-                h_pos = 0
-                w_pos = 0
-                llm_pos_ids_flat.extend([t_pos, h_pos, w_pos])
+            # 视觉部分：参考Rust代码的3D位置计算
+            img_start_pos = pre_text_len
+            # 简化处理：假设t=1, h=20, w=30 (对应600个patches)
+            t_len, h_len, w_len = 1, 20, 30
+            for t in range(t_len):
+                for h in range(h_len):
+                    for w in range(w_len):
+                        t_pos = img_start_pos + t
+                        h_pos = img_start_pos + h
+                        w_pos = img_start_pos + w
+                        llm_pos_ids_flat.extend([t_pos, h_pos, w_pos])
+
+            # 图像后文本：从视觉最大位置+1开始
+            vision_max_pos = max(img_start_pos + t_len - 1,
+                               img_start_pos + h_len - 1,
+                               img_start_pos + w_len - 1)
+            text_start_pos = vision_max_pos + 1
+            for i in range(post_text_len):
+                pos_val = text_start_pos + i
+                llm_pos_ids_flat.extend([pos_val, pos_val, pos_val])
 
             self.llm_pos_ids_len = len(llm_pos_ids_flat)
             self.llm_pos_ids = (c_uint * self.llm_pos_ids_len)(*llm_pos_ids_flat)
+            # print(f"[DEBUG] 构造的3D pos_ids长度: {self.llm_pos_ids_len//3}, 总长度: {self.llm_pos_ids_len}")
 
             # 构造 rope_section [3] = [t_max, h_max, w_max]
             # 从config读取，默认为[24, 20, 20]
@@ -521,7 +553,7 @@ class Qwen3VLForCausalLM:
         )
         print(input_content, end="", flush=True)
         tokens = self.tokenizer.encode(input_content)
-        print(f"[DEBUG] Generated tokens: {tokens}")
+        # print(f"[DEBUG] Generated tokens: {tokens}")
         infer_task = InferTask(
             0,
             tokens,
@@ -554,8 +586,10 @@ class Qwen3VLForCausalLM:
             # )
             output_str = self.tokenizer.decode(output_tokens[0])
             output_content += output_str
+            print(f"[DEBUG] Step {step_i}: token_id={output_tokens[0]}, token='{output_str}', eos_tokens={self.eos_token_id}")
             print(output_str, end="", flush=True)
             if output_tokens[0] in self.eos_token_id:
+                print(f"[DEBUG] EOS token detected, breaking generation loop")
                 break
             infer_task.next(output_tokens[0])
 
