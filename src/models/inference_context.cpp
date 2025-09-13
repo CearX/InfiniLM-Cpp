@@ -61,16 +61,19 @@ void InferenceContext::rmsnorm(std::shared_ptr<Tensor> y,
 }
 
 void InferenceContext::layernorm(std::shared_ptr<Tensor> y,
+                                 std::shared_ptr<Tensor> input_standardization,
+                                 std::shared_ptr<Tensor> input_std_deviation,
                                  std::shared_ptr<Tensor> x,
                                  std::shared_ptr<Tensor> w,
                                  std::shared_ptr<Tensor> b,
                                  float epsilon) {
-    size_t key = CacheManager::createDescriptorKey(y, x, w, b);
+    size_t key = CacheManager::createDescriptorKey(y, input_standardization, input_std_deviation, x, w, b);
 
     infiniopLayerNormDescriptor_t desc;
     if (!cache_manager->getLayerNormDescriptor(key, desc)) {
         RUN_INFINI(infiniopCreateLayerNormDescriptor(
-            op_handle, &desc, y->desc(), nullptr, nullptr, x->desc(), w->desc(), b ? b->desc() : nullptr, epsilon));
+            op_handle, &desc, y->desc(), input_standardization->desc(), input_std_deviation->desc(),
+            x->desc(), w->desc(), b ? b->desc() : nullptr, epsilon));
         cache_manager->putLayerNormDescriptor(key, desc);
     }
 
@@ -81,7 +84,8 @@ void InferenceContext::layernorm(std::shared_ptr<Tensor> y,
 
     RUN_INFINI(infiniopLayerNorm(
         desc, workspace, workspace_size,
-        y->data(), nullptr, nullptr, x->data(), w->data(), b ? b->data() : nullptr, stream));
+        y->data(), input_standardization->data(), input_std_deviation->data(),
+        x->data(), w->data(), b ? b->data() : nullptr, stream));
 }
 
 void InferenceContext::gemm(std::shared_ptr<Tensor> c,
