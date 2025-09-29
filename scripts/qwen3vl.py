@@ -76,8 +76,10 @@ def preprocess_image_qwen3vl(image_path: str):
     patches = patches / 255.0
 
     # 5. Normalize (ImageNet 标准)
-    mean = torch.tensor([0.485, 0.456, 0.406])
-    std = torch.tensor([0.229, 0.224, 0.225])
+    # mean = torch.tensor([0.485, 0.456, 0.406])
+    mean = torch.tensor([0.5, 0.5, 0.5])
+    # std = torch.tensor([0.229, 0.224, 0.225])
+    std = torch.tensor([0.5, 0.5, 0.5])
     patches = (patches - mean) / std
 
     # 6. CHW 调整: [H, W, C] -> [C, H, W]

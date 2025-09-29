@@ -136,13 +136,33 @@ std::tuple<std::shared_ptr<Tensor>, uint32_t> inferVision(const Qwen3VLMeta *met
     uint32_t patch_size = Qwen3VLConstants::PATCH_SIZE;
     uint32_t vision_hidden_size = static_cast<uint32_t>(meta->vision_hidden_size);
     uint32_t patch_feature_dim = in_channels * temporal_patch_size * patch_size * patch_size;
+
+    // 检查原始输入数据
+    DEBUG_PRINT("=== 原始输入数据检查 ===");
+    DEBUG_PRINT("num_patches=%u, in_channels=%u, temporal_patch_size=%u, patch_size=%u",
+                num_patches, in_channels, temporal_patch_size, patch_size);
+    DEBUG_PRINT("vision_hidden_size=%u, patch_feature_dim=%u", vision_hidden_size, patch_feature_dim);
+
+    // // 按 num_patches 行, patch_feature_dim 列打印 pixel_values
+    // DEBUG_PRINT("pixel_values 按 [num_patches, patch_feature_dim] 打印：");
+    // for (uint32_t i = 0; i < num_patches; ++i) {
+    //     std::string row_str = "pixel_values[" + std::to_string(i) + "]:";
+    //     for (uint32_t j = 0; j < patch_feature_dim; ++j) {
+    //         uint32_t idx = i * patch_feature_dim + j;
+    //         char buf[64];
+    //         snprintf(buf, sizeof(buf), " %f", pixel_values[idx]);
+    //         row_str += buf;
+    //     }
+    //     printf("%s\n", row_str.c_str()); // 添加这行来实际打印
+    // }
+
     // 输入像素: [num_patches, 3, 2, 16, 16]
-    std::shared_ptr<Tensor> pixel_values_buf;
+    std::shared_ptr<Tensor> pixel_values_buf; // 外部传入的 pixel_values 是 float
     if (rsrc.device == INFINI_DEVICE_CPU) {
-        pixel_values_buf = Tensor::weight(const_cast<float *>(pixel_values), dt_logits,
+        pixel_values_buf = Tensor::weight(const_cast<float *>(pixel_values), INFINI_DTYPE_F32,
                                           {num_patches, in_channels, temporal_patch_size, patch_size, patch_size});
     } else {
-        pixel_values_buf = Tensor::buffer(dt_logits, {num_patches, in_channels, temporal_patch_size, patch_size, patch_size}, rsrc.memory_pool);
+        pixel_values_buf = Tensor::buffer(INFINI_DTYPE_F32, {num_patches, in_channels, temporal_patch_size, patch_size, patch_size}, rsrc.memory_pool);
         RUN_INFINI(infinirtMemcpyAsync(pixel_values_buf->data(), pixel_values,
                                        sizeof(float) * num_patches * patch_feature_dim,
                                        INFINIRT_MEMCPY_H2D, stream));
@@ -152,12 +172,96 @@ std::tuple<std::shared_ptr<Tensor>, uint32_t> inferVision(const Qwen3VLMeta *met
     std::vector<int64_t> pads = {0, 0, 0};
     std::vector<int64_t> strides = {int64_t(temporal_patch_size), int64_t(patch_size), int64_t(patch_size)}; // strides = kernel_size
     std::vector<int64_t> dilations = {1, 1, 1};
-    // patch_embd
-    conv3d(conv_output,
-           pixel_values_buf,
-           weight->w_v_patch_embed_proj[0],
-           weight->b_v_patch_embed_proj[0],
-           pads, strides, dilations);
+    // 检查 conv3d 的输入数据
+    // DEBUG_PRINT("=== conv3d 输入数据检查 ===");
+    // DEBUG_PRINT("pixel_values_buf 信息:");
+    // pixel_values_buf->debug();
+
+    // DEBUG_PRINT("weight->w_v_patch_embed_proj[0] 信息:");
+    // weight->w_v_patch_embed_proj[0]->debug();
+
+    // DEBUG_PRINT("weight->b_v_patch_embed_proj[0] 信息:");
+    // weight->b_v_patch_embed_proj[0]->debug();
+
+    // 打印其他视觉相关权重和偏置
+    // DEBUG_PRINT("weight->w_v_pos_embed[0] 信息:");
+    // weight->w_v_pos_embed[0]->debug();
+
+    // merger 权重
+    // DEBUG_PRINT("weight->w_v_merger_ln_q[0] 信息:");
+    // weight->w_v_merger_ln_q[0]->debug();
+    // DEBUG_PRINT("weight->b_v_merger_ln_q[0] 信息:");
+    // weight->b_v_merger_ln_q[0]->debug();
+    // DEBUG_PRINT("weight->w_v_merger_mlp_0[0] 信息:");
+    // weight->w_v_merger_mlp_0[0]->debug();
+    // DEBUG_PRINT("weight->b_v_merger_mlp_0[0] 信息:");
+    // weight->b_v_merger_mlp_0[0]->debug();
+    DEBUG_PRINT("weight->w_v_merger_mlp_2[0] 信息:");
+    weight->w_v_merger_mlp_2[0]->debug();
+    DEBUG_PRINT("weight->b_v_merger_mlp_2[0] 信息:");
+    weight->b_v_merger_mlp_2[0]->debug();
+
+    // // merger_list 权重 (只打印第一个)
+    // DEBUG_PRINT("weight->w_v_merger_list_0_ln_q[0] 信息:");
+    // weight->w_v_merger_list_0_ln_q[0]->debug();
+    // DEBUG_PRINT("weight->b_v_merger_list_0_ln_q[0] 信息:");
+    // weight->b_v_merger_list_0_ln_q[0]->debug();
+    // DEBUG_PRINT("weight->w_v_merger_list_0_mlp_0[0] 信息:");
+    // weight->w_v_merger_list_0_mlp_0[0]->debug();
+    // DEBUG_PRINT("weight->b_v_merger_list_0_mlp_0[0] 信息:");
+    // weight->b_v_merger_list_0_mlp_0[0]->debug();
+    // DEBUG_PRINT("weight->w_v_merger_list_0_mlp_2[0] 信息:");
+    // weight->w_v_merger_list_0_mlp_2[0]->debug();
+    // DEBUG_PRINT("weight->b_v_merger_list_0_mlp_2[0] 信息:");
+    // weight->b_v_merger_list_0_mlp_2[0]->debug();
+
+    // // block0 权重和偏置
+    // DEBUG_PRINT("weight->w_v_norm1[0] 信息:");
+    // weight->w_v_norm1[0]->debug();
+    // DEBUG_PRINT("weight->b_v_norm1[0] 信息:");
+    // weight->b_v_norm1[0]->debug();
+    // DEBUG_PRINT("weight->w_v_attn_proj[0] 信息:");
+    // weight->w_v_attn_proj[0]->debug();
+    // DEBUG_PRINT("weight->b_v_attn_proj[0] 信息:");
+    // weight->b_v_attn_proj[0]->debug();
+    // DEBUG_PRINT("weight->w_v_attn_qkv[0] 信息:");
+    // weight->w_v_attn_qkv[0]->debug();
+    // DEBUG_PRINT("weight->b_v_attn_qkv[0] 信息:");
+    // weight->b_v_attn_qkv[0]->debug();
+    // DEBUG_PRINT("weight->w_v_norm2[0] 信息:");
+    // weight->w_v_norm2[0]->debug();
+    // DEBUG_PRINT("weight->b_v_norm2[0] 信息:");
+    // weight->b_v_norm2[0]->debug();
+    // DEBUG_PRINT("weight->w_v_mlp_fc1[0] 信息:");
+    // weight->w_v_mlp_fc1[0]->debug();
+    // DEBUG_PRINT("weight->b_v_mlp_fc1[0] 信息:");
+    // weight->b_v_mlp_fc1[0]->debug();
+    // DEBUG_PRINT("weight->w_v_mlp_fc2[0] 信息:");
+    // weight->w_v_mlp_fc2[0]->debug();
+    // DEBUG_PRINT("weight->b_v_mlp_fc2[0] 信息:");
+    // weight->b_v_mlp_fc2[0]->debug();
+
+    DEBUG_PRINT("conv3d 参数: pads=[%ld,%ld,%ld], strides=[%ld,%ld,%ld], dilations=[%ld,%ld,%ld]",
+                pads[0], pads[1], pads[2], strides[0], strides[1], strides[2],
+                dilations[0], dilations[1], dilations[2]);
+
+    DEBUG_PRINT("conv_output 形状: [%zu,%zu,%zu,%zu,%zu]",
+                conv_output->shape()[0], conv_output->shape()[1], conv_output->shape()[2],
+                conv_output->shape()[3], conv_output->shape()[4]);
+
+    // // patch_embd
+    // conv3d(conv_output,
+    //        pixel_values_buf,
+    //        weight->w_v_patch_embed_proj[0],
+    //        weight->b_v_patch_embed_proj[0],
+    //        pads, strides, dilations);
+
+    // // 打印 conv3d 的结果
+    // DEBUG_PRINT("=== conv3d 输出结果 ===");
+    // conv_output->debug();
+
+    exit(0);
+
     auto vit_hidden = conv_output->view({num_patches, vision_hidden_size});
 
     // ===================2.abs_pos_embd===================

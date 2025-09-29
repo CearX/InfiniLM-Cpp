@@ -1,5 +1,7 @@
+#include "infinicore.h"
 #include "qwen3_vl.hpp"
 
+#include <cassert>
 #include <cmath>
 
 inline std::shared_ptr<Tensor> getSinTable(size_t dctx, size_t dh, float theta, infiniDtype_t dtype) {
@@ -122,6 +124,8 @@ Qwen3VLWeights::Qwen3VLWeights(
     _device_weights.resize(ndev);
     infiniDtype_t dt_logits = meta->dt_logits;
     infiniDtype_t dt_norm_w = meta->dt_norm_w;
+    assert(dt_logits == dt_norm_w);
+    assert(dt_logits == INFINI_DTYPE_BF16);
     size_t nlayer = meta->nlayer;
     size_t d = meta->d;
     size_t nh = meta->nh / ndev;
@@ -179,13 +183,13 @@ Qwen3VLWeights::Qwen3VLWeights(
     weight->W_VAR.push_back(W_VAR);
 
 // merger 权重
-#define REGISTER_MERGER()                                                                                                                        \
-    REGISTER_LAYER_WEIGHT_1D("visual.merger.ln_q.bias", b_v_merger_ln_q, vision_hidden_size, dt_norm_w, FULL);                                   \
-    REGISTER_LAYER_WEIGHT_1D("visual.merger.ln_q.weight", w_v_merger_ln_q, vision_hidden_size, dt_norm_w, FULL);                                 \
-    REGISTER_LAYER_WEIGHT_1D("visual.merger.mlp.0.bias", b_v_merger_mlp_0, 4 * vision_hidden_size, dt_logits, COLUMN);                           \
-    REGISTER_LAYER_WEIGHT_2D("visual.merger.mlp.0.weight", w_v_merger_mlp_0, 4 * vision_hidden_size, 4 * vision_hidden_size, dt_logits, COLUMN); \
-    REGISTER_LAYER_WEIGHT_1D("visual.merger.mlp.2.bias", b_v_merger_mlp_2, d, dt_logits, COLUMN);                                                \
-    REGISTER_LAYER_WEIGHT_2D("visual.merger.mlp.2.weight", w_v_merger_mlp_2, d, 4 * vision_hidden_size, dt_logits, COLUMN);
+#define REGISTER_MERGER()                                                                                                                      \
+    REGISTER_LAYER_WEIGHT_1D("visual.merger.ln_q.bias", b_v_merger_ln_q, vision_hidden_size, dt_norm_w, FULL);                                 \
+    REGISTER_LAYER_WEIGHT_1D("visual.merger.ln_q.weight", w_v_merger_ln_q, vision_hidden_size, dt_norm_w, FULL);                               \
+    REGISTER_LAYER_WEIGHT_1D("visual.merger.mlp.0.bias", b_v_merger_mlp_0, 4 * vision_hidden_size, dt_logits, FULL);                           \
+    REGISTER_LAYER_WEIGHT_2D("visual.merger.mlp.0.weight", w_v_merger_mlp_0, 4 * vision_hidden_size, 4 * vision_hidden_size, dt_logits, FULL); \
+    REGISTER_LAYER_WEIGHT_1D("visual.merger.mlp.2.bias", b_v_merger_mlp_2, d, dt_logits, FULL);                                                \
+    REGISTER_LAYER_WEIGHT_2D("visual.merger.mlp.2.weight", w_v_merger_mlp_2, d, 4 * vision_hidden_size, dt_logits, FULL);
 
 // merger_list 权重
 #define REGISTER_MERGER_LIST(IDX)                                                                                                                                           \
